@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -24,9 +25,10 @@ class Remote(ConfigurableResource):
 class Landing(ConfigurableResource):
     root: str
 
-    def path(self, dataset_key: str, business_date: date, filename: str, version: int) -> Path:
+    def path(self, feed: str, relative: str, version: int) -> Path:
+        """Mirror the remote layout: <root>/<feed>/<path relative to the feed path>[.vN]."""
         suffix = f".v{version}" if version > 1 else ""
-        return Path(self.root, dataset_key, f"{business_date:%Y}", f"{business_date:%m}", filename + suffix)
+        return Path(self.root, feed, relative + suffix)
 
 
 metadata = sa.MetaData()
@@ -35,17 +37,21 @@ files = sa.Table(
     "files",
     metadata,
     sa.Column("id", sa.Integer, primary_key=True),
-    sa.Column("dataset", sa.String(200), nullable=False, index=True),
+    sa.Column("feed", sa.String(100), nullable=False, index=True),
     sa.Column("remote_path", sa.String(1000), nullable=False),
     sa.Column("remote_mtime", sa.String(40)),
     sa.Column("size", sa.BigInteger),
     sa.Column("version", sa.Integer, nullable=False, default=1),
     sa.Column("status", sa.String(20), nullable=False),  # downloaded | superseded | ignored
-    sa.Column("business_date", sa.Date, index=True),
     sa.Column("local_path", sa.String(1000)),
     sa.Column("sha256", sa.String(64)),
     sa.Column("downloaded_at", sa.DateTime),
+    # assigned by classify(), possibly long after download
+    sa.Column("table", sa.String(200), index=True),
+    sa.Column("business_date", sa.Date, index=True),
+    sa.Column("attributes", sa.JSON),  # named groups of the matching select pattern
     sa.Column("loaded_at", sa.DateTime),
+    sa.Column("load_id", sa.String(100)),
 )
 
 
@@ -61,9 +67,9 @@ class Manifest(ConfigurableResource):
             metadata.create_all(self._engine)
         return self._engine
 
-    def latest(self, dataset: str) -> dict[str, sa.Row]:
+    def latest(self, feed: str) -> dict[str, sa.Row]:
         """Newest known row per remote path (downloaded or ignored)."""
-        stmt = sa.select(files).where(files.c.dataset == dataset, files.c.status != "superseded")
+        stmt = sa.select(files).where(files.c.feed == feed, files.c.status != "superseded")
         with self.engine().connect() as conn:
             return {row.remote_path: row for row in conn.execute(stmt)}
 
@@ -72,30 +78,79 @@ class Manifest(ConfigurableResource):
             if row.get("version", 1) > 1:
                 conn.execute(
                     sa.update(files)
-                    .where(files.c.dataset == row["dataset"], files.c.remote_path == row["remote_path"])
+                    .where(files.c.feed == row["feed"], files.c.remote_path == row["remote_path"])
                     .values(status="superseded")
                 )
             conn.execute(sa.insert(files).values(**row))
 
-    def file_counts(self, dataset: str, since: date) -> dict[date, int]:
+    def classify(self, tables) -> int:
+        """Assign table, business_date and attributes to downloaded rows matching a table's select patterns.
+
+        Raises AmbiguousMatch (after committing the unambiguous ones) if a file matches more than one table.
+        """
+        assigned, ambiguous = 0, []
+        with self.engine().begin() as conn:
+            unassigned = conn.execute(
+                sa.select(files.c.id, files.c.feed, files.c.remote_path).where(
+                    files.c.status == "downloaded", files.c.table.is_(None)
+                )
+            ).all()
+            for row in unassigned:
+                matches = [(t, m) for t in tables if t.feed == row.feed for m in [_match(t, row.remote_path)] if m]
+                if len(matches) > 1:
+                    ambiguous.append((row.remote_path, [t.key for t, _ in matches]))
+                    continue
+                if matches:
+                    t, m = matches[0]
+                    groups = m.groupdict()
+                    raw_date = groups.pop("date", None) or m.group(1)
+                    day = datetime.strptime(raw_date, t.date_format).date()
+                    conn.execute(
+                        sa.update(files).where(files.c.id == row.id).values(table=t.key, business_date=day, attributes=groups)
+                    )
+                    assigned += 1
+        if ambiguous:
+            raise AmbiguousMatch(ambiguous)
+        return assigned
+
+    def files_for(self, table: str, day: date) -> list[sa.Row]:
+        stmt = sa.select(files).where(
+            files.c.table == table, files.c.business_date == day, files.c.status == "downloaded"
+        ).order_by(files.c.id)
+        with self.engine().connect() as conn:
+            return conn.execute(stmt).all()
+
+    def pending_days(self, table: str) -> list[date]:
+        stmt = sa.select(sa.distinct(files.c.business_date)).where(
+            files.c.table == table, files.c.status == "downloaded", files.c.loaded_at.is_(None)
+        )
+        with self.engine().connect() as conn:
+            return sorted(d for (d,) in conn.execute(stmt))
+
+    def mark_loaded(self, ids: list[int], load_id: str) -> None:
+        with self.engine().begin() as conn:
+            conn.execute(sa.update(files).where(files.c.id.in_(ids)).values(loaded_at=utcnow(), load_id=load_id))
+
+    def file_counts(self, table: str, since: date) -> dict[date, int]:
         stmt = (
             sa.select(files.c.business_date, sa.func.count())
-            .where(files.c.dataset == dataset, files.c.status == "downloaded", files.c.business_date >= since)
+            .where(files.c.table == table, files.c.status == "downloaded", files.c.business_date >= since)
             .group_by(files.c.business_date)
         )
         with self.engine().connect() as conn:
             return dict(conn.execute(stmt).all())
 
-    def pending_loads(self, dataset: str) -> dict[date, list[str]]:
-        """Downloaded files not yet loaded, grouped by business date. Used by the load stage."""
-        stmt = sa.select(files.c.business_date, files.c.local_path).where(
-            files.c.dataset == dataset, files.c.status == "downloaded", files.c.loaded_at.is_(None)
-        )
-        out: dict[date, list[str]] = {}
-        with self.engine().connect() as conn:
-            for day, path in conn.execute(stmt):
-                out.setdefault(day, []).append(path)
-        return out
+
+def _match(table, remote_path: str) -> re.Match | None:
+    if any(re.search(p, remote_path) for p in table.ignore):
+        return None
+    return next((m for p in table.select if (m := re.search(p, remote_path))), None)
+
+
+class AmbiguousMatch(Exception):
+    def __init__(self, files: list[tuple[str, list[str]]]):
+        super().__init__("files match more than one table: " + "; ".join(f"{p} -> {t}" for p, t in files))
+        self.files = files
 
 
 def utcnow() -> datetime:

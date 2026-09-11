@@ -1,27 +1,57 @@
-"""Compare what arrived against the delivery calendar."""
+"""Expectations: which business days should have delivered files, and are any missing."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, timedelta
-
-from ingest.config import Dataset
+from typing import Protocol
 
 LOOKBACK_DAYS = 7
 
 
-def expected_days(dataset: Dataset, start: date, end: date) -> list[date]:
-    if dataset.calendar:
+class Expectation(Protocol):
+    lag_days: int
+
+    def missing_days(self, counts: dict[date, int], today: date) -> list[date]: ...
+
+
+@dataclass(frozen=True)
+class NoExpectation:
+    lag_days: int = 0
+
+    def missing_days(self, counts, today):
+        return []
+
+
+@dataclass(frozen=True)
+class Weekdays:
+    lag_days: int = 1
+    files_per_day: int = 1
+    holidays: tuple[date, ...] = ()
+
+    def expected_days(self, start: date, end: date) -> list[date]:
+        days = [start + timedelta(i) for i in range((end - start).days + 1)]
+        return [d for d in days if d.weekday() < 5 and d not in self.holidays]
+
+    def missing_days(self, counts: dict[date, int], today: date) -> list[date]:
+        last_due = today - timedelta(days=self.lag_days)
+        days = self.expected_days(last_due - timedelta(days=LOOKBACK_DAYS), last_due)
+        return [d for d in days if counts.get(d, 0) < self.files_per_day]
+
+
+@dataclass(frozen=True)
+class ExchangeCalendar:
+    """Trading sessions of an exchange_calendars calendar, e.g. XLON, XNYS, XFRA."""
+
+    name: str = "XLON"
+    lag_days: int = 1
+    files_per_day: int = 1
+    holidays: tuple[date, ...] = ()
+
+    def expected_days(self, start: date, end: date) -> list[date]:
         import exchange_calendars as xc
 
-        days = [d.date() for d in xc.get_calendar(dataset.calendar).sessions_in_range(str(start), str(end))]
-    else:
-        days = [start + timedelta(i) for i in range((end - start).days + 1)]
-        days = [d for d in days if d.weekday() < 5]
-    return [d for d in days if d not in dataset.extra_holidays]
+        sessions = xc.get_calendar(self.name).sessions_in_range(str(start), str(end))
+        return [d.date() for d in sessions if d.date() not in self.holidays]
 
-
-def missing_days(dataset: Dataset, counts: dict[date, int], today: date) -> list[date]:
-    """Business days whose files should have arrived by today but have not."""
-    last_due = today - timedelta(days=dataset.expected_lag_days)
-    days = expected_days(dataset, last_due - timedelta(days=LOOKBACK_DAYS), last_due)
-    return [d for d in days if counts.get(d, 0) < dataset.expected_files_per_day]
+    missing_days = Weekdays.missing_days

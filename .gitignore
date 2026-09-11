@@ -1,6 +1,7 @@
 .venv/
 landing/
 manifest.db
+warehouse*.db
+schemas/export/
 __pycache__/
 .pytest_cache/
-tmp*/

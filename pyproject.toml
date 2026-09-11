@@ -9,6 +9,9 @@ dependencies = [
     "fsspec>=2025.3",
     "sqlalchemy>=2.0",
     "exchange-calendars>=4.10",
+    "dlt[mssql,sqlalchemy]>=1.10",
+    "pyarrow>=18",
+    "fastavro>=1.9",
 ]
 
 [project.optional-dependencies]
