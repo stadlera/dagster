@@ -45,6 +45,7 @@ class Table:
     ignore: tuple[str, ...] = ()  # downloaded, but never loaded into this table
     date_format: str = "%Y-%m-%d"
     start_date: str = "2026-01-01"
+    partition: str = "daily"  # daily | monthly: one load run covers all files with a business date in the window
     loader: Loader = field(default_factory=CsvLoader)
     expectation: Expectation = field(default_factory=ExchangeCalendar)
     merge: ReplaceDay | Upsert = field(default_factory=ReplaceDay)

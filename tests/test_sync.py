@@ -4,7 +4,10 @@ import time
 import zipfile
 from datetime import date
 
+import dlt
 import fastavro
+import pyarrow as pa
+import yaml
 import fsspec
 import pytest
 import sqlalchemy as sa
@@ -12,8 +15,9 @@ import sqlalchemy as sa
 from ingest.config import Feed, Table, Upsert
 from ingest.delivery import Weekdays
 from ingest.load import load
-from ingest.loaders import AvroLoader
+from ingest.loaders import AvroLoader, JsonLoader
 from ingest.resources import AmbiguousMatch, Landing, Manifest, Remote
+from ingest.schema import committed_types, profile, write_schema
 from ingest.sync import sync
 
 TABLE = Table("tradeweb", "em", select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv(\.zip|\.gz)?$",))
@@ -32,8 +36,8 @@ def env(tmp_path):
     return fsspec.filesystem("file"), feed, landing, manifest, remote
 
 
-def run_load(tmp_path, manifest, table, day, load_id):
-    return load(table, day, manifest.files_for(table.key, day), f"sqlite:///{tmp_path}/warehouse.db", "raw", load_id, schema_dir=tmp_path / "schemas")
+def run_load(tmp_path, manifest, table, day, load_id, end=None):
+    return load(table, manifest.files_for(table.key, day, end), f"sqlite:///{tmp_path}/warehouse.db", "raw", load_id, schema_dir=tmp_path / "schemas")
 
 
 def query(tmp_path, sql):
@@ -59,7 +63,7 @@ def test_classify_assigns_table_and_business_date_after_the_fact(env):
     assert manifest.file_counts(TABLE.key, date(2026, 1, 1)) == {}
     assert manifest.classify([TABLE]) == 2
     assert manifest.classify([TABLE]) == 0
-    assert manifest.pending_days(TABLE.key) == [date(2026, 9, 8), date(2026, 9, 9)]
+    assert list(manifest.pending_days(TABLE.key)) == [date(2026, 9, 8), date(2026, 9, 9)]
 
 
 def test_classify_multiple_selects_named_groups_ignore_and_ambiguity(env):
@@ -76,7 +80,7 @@ def test_classify_multiple_selects_named_groups_ignore_and_ambiguity(env):
     assert manifest.classify([regional]) == 3
     rows = manifest.files_for(regional.key, date(2026, 9, 8))
     assert sorted((r.attributes or {} for r in rows), key=len) == [{}, {"region": "apac"}]
-    assert manifest.pending_days(regional.key) == [date(2026, 9, 8), date(2026, 9, 9)]
+    assert list(manifest.pending_days(regional.key)) == [date(2026, 9, 8), date(2026, 9, 9)]
 
     other = Table("tradeweb", "em_copy", select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",))
     (remote / "em-2026-09-10.csv").write_bytes(b"isin,price\n")
@@ -147,6 +151,52 @@ def test_avro_loader(env, tmp_path):
     manifest.classify([table])
     assert run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-1")["rows"] == 2
     assert query(tmp_path, "select isin, qty from em_avro order by isin") == [("XS1", 5), ("XS2", 6)]
+
+
+def test_nested_json_is_flattened_and_unnested_by_dlt(env, tmp_path):
+    fs, feed, landing, manifest, remote = env
+    (remote / "em-2026-09-12.json").write_bytes(
+        b'{"isin":"XS1","issuer":{"name":"ACME","country":"DE"},"coupons":[{"date":"2026-01-01","amt":1.5},{"date":"2026-07-01","amt":1.5}]}\n'
+        b'{"isin":"XS2","issuer":{"name":"B","country":"FR"},"coupons":[]}\n'
+    )
+    sync(fs, feed, landing, manifest)
+    table = Table("tradeweb", "bonds", select=(r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.json$",)).with_loader(JsonLoader())
+    manifest.classify([table])
+    run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-1")
+    run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-2")  # reload must also replace child rows
+    assert query(tmp_path, "select isin, issuer__name, _business_date, _load_id from bonds order by isin") == [
+        ("XS1", "ACME", "2026-09-12", "run-2"), ("XS2", "B", "2026-09-12", "run-2")]
+    assert query(tmp_path, "select amt from bonds__coupons") == [(1.5,), (1.5,)]
+
+
+def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_path):
+    fs, feed, landing, manifest, remote = env
+    (remote / "em-2026-09-08.csv").write_bytes(b"id,isin,price,as_of,note\n00123,XS1,1.50,2026-09-08,hello\n7,XS2,12.345,2026-09-08,\n")
+    sync(fs, feed, landing, manifest)
+    manifest.classify([TABLE])
+    schema_dir = tmp_path / "schemas"
+
+    path = write_schema(profile(TABLE, manifest.files_for(TABLE.key, date(2026, 9, 8))), TABLE, schema_dir)
+    cols = yaml.safe_load(path.read_text())["tables"]["em"]["columns"]
+    assert cols["id"] == {"nullable": True, "data_type": "bigint"}
+    assert cols["price"] == {"nullable": True, "data_type": "decimal", "precision": 5, "scale": 3}
+    assert cols["as_of"]["data_type"] == "date" and cols["note"] == {"nullable": True, "data_type": "text", "precision": 20}
+
+    # review step: the id has leading zeros, keep it as text
+    path.write_text(path.read_text().replace("data_type: bigint", "data_type: text\n        precision: 20"))
+    assert committed_types(TABLE, schema_dir, dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities())["id"] == pa.string()
+
+    run_load(tmp_path, manifest, TABLE, date(2026, 9, 8), "run-1")
+    assert query(tmp_path, "select id, price from em order by id") == [("00123", 1.5), ("7", 12.345)]
+
+
+def test_monthly_window_loads_all_days(env, tmp_path):
+    fs, feed, landing, manifest, remote = env
+    sync(fs, feed, landing, manifest)
+    monthly = Table("tradeweb", "em_monthly", select=TABLE.select, partition="monthly")
+    manifest.classify([monthly])
+    assert run_load(tmp_path, manifest, monthly, date(2026, 9, 1), "run-1", end=date(2026, 10, 1))["rows"] == 2
+    assert query(tmp_path, "select distinct _business_date from em_monthly order by 1") == [("2026-09-08",), ("2026-09-09",)]
 
 
 def test_missing_days_respects_calendar_and_lag():

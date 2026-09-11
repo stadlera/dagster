@@ -1,18 +1,28 @@
-"""Loaders turn one binary stream into arrow tables. Plug your own by implementing `read`."""
+"""Loaders turn one binary stream into arrow tables or lists of dicts. Plug your own by implementing `read`.
+
+`column_types` are the committed types (arrow) for known columns. CSV reads with them instead of
+inferring per file; typed formats (Parquet, Avro) carry their own schema and ignore them; JSON yields
+dicts and lets dlt coerce to the committed schema. `column_types="string"` reads everything as text
+(used by the profiler).
+"""
 
 from __future__ import annotations
 
+import csv
+import io
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import BinaryIO, Callable, Iterator, Protocol
 
 import pyarrow as pa
 import pyarrow.csv
 import pyarrow.parquet
 
+ColumnTypes = dict[str, pa.DataType] | str | None
+
 
 class Loader(Protocol):
-    def read(self, stream: BinaryIO) -> Iterator[pa.Table | list[dict]]: ...
+    def read(self, stream: BinaryIO, column_types: ColumnTypes = None) -> Iterator[pa.Table | list[dict]]: ...
 
 
 @dataclass(frozen=True)
@@ -23,13 +33,22 @@ class CsvLoader:
     column_names: tuple[str, ...] | None = None  # for files without a header row
     block_size: int = 1 << 24
 
-    def read(self, stream):
+    def read(self, stream, column_types=None):
+        skip_rows, column_names = self.skip_rows, self.column_names
+        if column_types == "string":  # consume preamble + header ourselves, then type every column as text
+            for _ in range(skip_rows):
+                stream.readline()
+            if column_names is None:
+                header = stream.readline().decode(self.encoding)
+                column_names = tuple(next(csv.reader(io.StringIO(header), delimiter=self.delimiter)))
+            skip_rows, column_types = 0, {c: pa.string() for c in column_names}
         reader = pa.csv.open_csv(
             stream,
             read_options=pa.csv.ReadOptions(
-                encoding=self.encoding, skip_rows=self.skip_rows, column_names=self.column_names, block_size=self.block_size
+                encoding=self.encoding, skip_rows=skip_rows, column_names=column_names, block_size=self.block_size
             ),
             parse_options=pa.csv.ParseOptions(delimiter=self.delimiter),
+            convert_options=pa.csv.ConvertOptions(column_types=column_types or {}),
         )
         for batch in reader:
             yield pa.Table.from_batches([batch])
@@ -39,16 +58,16 @@ class CsvLoader:
 class ParquetLoader:
     batch_size: int = 1 << 16
 
-    def read(self, stream):
+    def read(self, stream, column_types=None):
         for batch in pa.parquet.ParquetFile(stream).iter_batches(batch_size=self.batch_size):
             yield pa.Table.from_batches([batch])
 
 
 @dataclass(frozen=True)
 class JsonLoader:
-    """JSON lines, or a single top-level array."""
+    """JSON lines, or a single top-level array. Yields dicts: dlt flattens objects and unnests lists."""
 
-    def read(self, stream):
+    def read(self, stream, column_types=None):
         text = stream.read()
         if text.lstrip().startswith(b"["):
             yield json.loads(text)
@@ -60,7 +79,7 @@ class JsonLoader:
 class AvroLoader:
     batch_size: int = 1 << 16
 
-    def read(self, stream):
+    def read(self, stream, column_types=None):
         import fastavro
 
         rows = []
@@ -79,5 +98,5 @@ class FunctionLoader:
 
     fn: Callable[[BinaryIO], Iterator[pa.Table | list[dict]]]
 
-    def read(self, stream):
+    def read(self, stream, column_types=None):
         yield from self.fn(stream)

@@ -19,6 +19,7 @@ import fsspec
 import pyarrow as pa
 
 from ingest.config import Table, Upsert
+from ingest.schema import committed_types, schema_name
 
 # keep provider column names, only fix characters that are illegal in SQL identifiers
 os.environ.setdefault("SCHEMA__NAMING", "sql_cs_v1")
@@ -36,9 +37,18 @@ def destination(url: str):
     return dlt.destinations.sqlalchemy(credentials=url)
 
 
-def load(table: Table, day: date, files: list, destination_url: str, dataset_name: str, load_id: str, schema_dir: Path = SCHEMA_DIR) -> dict:
-    """files: manifest rows (need .id, .local_path, .attributes). Returns dlt load metrics."""
+def load(table: Table, files: list, destination_url: str, dataset_name: str, load_id: str, schema_dir: Path = SCHEMA_DIR) -> dict:
+    """files: manifest rows (need .id, .local_path, .business_date, .attributes). Returns dlt load metrics."""
     upsert = isinstance(table.merge, Upsert)
+    dest = destination(destination_url)
+    column_types = committed_types(table, schema_dir, dest.capabilities())
+
+    columns = {
+        "_business_date": {"data_type": "date", "nullable": False},
+        "_source_file": {"data_type": "bigint", "nullable": False},
+        "_load_id": {"data_type": "text", "nullable": False},
+        **{f"_{k}": {"data_type": "text", "nullable": True} for k in table.attribute_names},
+    }
 
     @dlt.resource(
         name=table.name,
@@ -46,21 +56,22 @@ def load(table: Table, day: date, files: list, destination_url: str, dataset_nam
         write_disposition={"disposition": "merge", "strategy": "delete-insert"},
         primary_key=list(table.merge.keys) if upsert else None,
         merge_key=None if upsert else "_business_date",
+        columns=columns,
         schema_contract=CONTRACT,
     )
-    def rows() -> Iterator[pa.Table]:
+    def rows() -> Iterator[pa.Table | list[dict]]:
         for f in files:
-            meta = {"_business_date": (day, pa.date32()), "_source_file": (f.id, pa.int64()), "_load_id": (load_id, pa.string())}
-            meta |= {f"_{k}": ((f.attributes or {}).get(k), pa.string(), True) for k in table.attribute_names}
+            meta = {"_business_date": f.business_date, "_source_file": f.id, "_load_id": load_id}
+            meta |= {f"_{k}": (f.attributes or {}).get(k) for k in table.attribute_names}
             for stream in open_streams(Path(f.local_path)):
                 with stream:
-                    for batch in table.loader.read(stream):
-                        yield _with_metadata(batch, meta)
+                    for batch in table.loader.read(stream, column_types):
+                        yield _with_metadata(batch, meta, columns)
 
     pipeline = dlt.pipeline(
-        pipeline_name=f"{table.feed}_{table.name}",
+        pipeline_name=schema_name(table),
         pipelines_dir=tempfile.mkdtemp(prefix="dlt_"),  # state lives in the destination, not on this pod
-        destination=destination(destination_url),
+        destination=dest,
         dataset_name=dataset_name,
         import_schema_path=str(schema_dir / "import"),
         export_schema_path=str(schema_dir / "export"),
@@ -82,10 +93,15 @@ def open_streams(path: Path) -> Iterator[BinaryIO]:
         yield fsspec.open(str(path), "rb", compression=fsspec.utils.infer_compression(name)).open()
 
 
-def _with_metadata(batch: pa.Table | list[dict], meta: dict) -> pa.Table:
+ARROW_TYPES = {"date": pa.date32(), "bigint": pa.int64(), "text": pa.string()}
+
+
+def _with_metadata(batch: pa.Table | list[dict], meta: dict, columns: dict) -> pa.Table | list[dict]:
+    """Arrow tables get typed columns appended. Dicts stay dicts so dlt can flatten and unnest them."""
     if not isinstance(batch, pa.Table):
-        batch = pa.Table.from_pylist(batch)
+        return [row | meta for row in batch]
     n = len(batch)
-    for name, (value, typ, *nullable) in meta.items():
-        batch = batch.append_column(pa.field(name, typ, nullable=bool(nullable)), pa.array([value] * n, typ))
+    for name, value in meta.items():
+        typ = ARROW_TYPES[columns[name]["data_type"]]
+        batch = batch.append_column(pa.field(name, typ, nullable=columns[name]["nullable"]), pa.array([value] * n, typ))
     return batch

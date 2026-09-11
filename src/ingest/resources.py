@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import fsspec
@@ -113,19 +113,24 @@ class Manifest(ConfigurableResource):
             raise AmbiguousMatch(ambiguous)
         return assigned
 
-    def files_for(self, table: str, day: date) -> list[sa.Row]:
+    def files_for(self, table: str, start: date, end: date | None = None) -> list[sa.Row]:
+        """Downloaded files with start <= business_date < end (end defaults to the day after start)."""
+        end = end or start + timedelta(days=1)
         stmt = sa.select(files).where(
-            files.c.table == table, files.c.business_date == day, files.c.status == "downloaded"
-        ).order_by(files.c.id)
+            files.c.table == table, files.c.business_date >= start, files.c.business_date < end, files.c.status == "downloaded"
+        ).order_by(files.c.business_date, files.c.id)
         with self.engine().connect() as conn:
             return conn.execute(stmt).all()
 
-    def pending_days(self, table: str) -> list[date]:
-        stmt = sa.select(sa.distinct(files.c.business_date)).where(
-            files.c.table == table, files.c.status == "downloaded", files.c.loaded_at.is_(None)
+    def pending_days(self, table: str) -> dict[date, int]:
+        """Business dates with unloaded files -> highest pending file id (changes when a revision arrives)."""
+        stmt = (
+            sa.select(files.c.business_date, sa.func.max(files.c.id))
+            .where(files.c.table == table, files.c.status == "downloaded", files.c.loaded_at.is_(None))
+            .group_by(files.c.business_date)
         )
         with self.engine().connect() as conn:
-            return sorted(d for (d,) in conn.execute(stmt))
+            return dict(sorted(conn.execute(stmt).all()))
 
     def mark_loaded(self, ids: list[int], load_id: str) -> None:
         with self.engine().begin() as conn:

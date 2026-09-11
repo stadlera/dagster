@@ -12,6 +12,8 @@ Dagster ingestion of external finance datasets.
     src/ingest/sync.py         list remote, diff against manifest, download new/changed files
     src/ingest/loaders.py      CsvLoader, ParquetLoader, JsonLoader, AvroLoader, FunctionLoader (stream -> arrow)
     src/ingest/load.py         open landed files (zip/tar members and gz via fsspec), add metadata, dlt merge
+    src/ingest/schema.py       committed schema: profiler proposes a dlt schema YAML, loaders read with its types
+    src/ingest/profile.py      CLI: uv run python -m ingest.profile <feed>/<table>
     src/ingest/delivery.py     expectations: ExchangeCalendar, Weekdays, NoExpectation
     src/ingest/factory.py      config -> assets, delivery checks, sync schedule, load sensor
     src/ingest/definitions.py  Dagster entry point: declare feeds and tables here
@@ -34,6 +36,19 @@ and adjusted with builder methods:
 Several `select` patterns may feed one table; `ignore` patterns exclude files from it. A file
 matching two tables fails classification. The named group `date` is the business date, every
 other named group becomes a `_<name>` column.
+
+`partition="monthly"` on a Table makes one load run cover all business dates of the month.
+Empty partitions materialize with zero rows; missing deliveries are reported by the delivery check.
+
+## Schema workflow
+
+1. Run the raw asset so files are landed and classified.
+2. `uv run python -m ingest.profile tradeweb/em` samples recent files and writes
+   `schemas/import/tradeweb_em.schema.yaml`: bigint / decimal(p,s) / date / timestamp are detected
+   from the values, text gets a length bucket (20, 50, 100, 255, 1000, else max).
+3. Review the YAML (e.g. keep identifiers with leading zeros as text), commit it.
+4. Loads read with the committed types: CSV via pyarrow column types, JSON coerced by dlt,
+   Parquet/Avro keep their own schema. New columns are added (warning), a changed type fails.
 
 Loaded rows carry `_business_date`, `_source_file` (manifest id) and `_load_id` (Dagster run id).
 Reloading a partition replaces that business date; `Upsert` replaces rows with the same key

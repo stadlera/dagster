@@ -9,12 +9,12 @@ from dagster import (
     AssetKey,
     AssetSelection,
     DailyPartitionsDefinition,
+    MonthlyPartitionsDefinition,
     Definitions,
     MaterializeResult,
     RetryPolicy,
     RunRequest,
     ScheduleDefinition,
-    SensorEvaluationContext,
     asset,
     asset_check,
     sensor,
@@ -82,22 +82,29 @@ def build_delivery_check(feed: Feed, table: Table):
     return delivery
 
 
+PARTITIONS = {"daily": DailyPartitionsDefinition, "monthly": MonthlyPartitionsDefinition}
+
+
+def partition_key(table: Table, day: date) -> str:
+    return str(day.replace(day=1) if table.partition == "monthly" else day)
+
+
 def build_table_asset(feed: Feed, table: Table):
     @asset(
         key=table_key(table),
         deps=[raw_key(feed)],
         group_name=feed.name,
-        partitions_def=DailyPartitionsDefinition(start_date=table.start_date),
+        partitions_def=PARTITIONS[table.partition](start_date=table.start_date),
         required_resource_keys={"manifest", "sql"},
         description=f"{type(table.loader).__name__} on {', '.join(table.select)}",
     )
     def sql_table(context: AssetExecutionContext) -> MaterializeResult:
         manifest: Manifest = context.resources.manifest
-        day = date.fromisoformat(context.partition_key)
-        files = manifest.files_for(table.key, day)
+        window = context.partition_time_window
+        files = manifest.files_for(table.key, window.start.date(), window.end.date())
         if not files:
             return MaterializeResult(metadata={"rows": 0, "files": 0})
-        result = load(table, day, files, context.resources.sql.url, context.resources.sql.dataset_name, context.run_id)
+        result = load(table, files, context.resources.sql.url, context.resources.sql.dataset_name, context.run_id)
         manifest.mark_loaded([f.id for f in files], context.run_id)
         return MaterializeResult(metadata={"rows": result["rows"], "files": len(files), "dlt_load_ids": result["load_ids"]})
 
@@ -106,13 +113,17 @@ def build_table_asset(feed: Feed, table: Table):
 
 def build_load_sensor(feed: Feed, tables: list[Table]):
     @sensor(name=f"load_{feed.name}", target=AssetSelection.keys(*[table_key(t) for t in tables]), minimum_interval_seconds=300)
-    def load_sensor(context: SensorEvaluationContext, manifest: Manifest):
+    def load_sensor(manifest: Manifest):
         for t in tables:
-            for day in manifest.pending_days(t.key):
+            pending: dict[str, int] = {}  # partition key -> newest pending file id
+            for day, newest_file in manifest.pending_days(t.key).items():
+                key = partition_key(t, day)
+                pending[key] = max(pending.get(key, 0), newest_file)
+            for key, newest_file in pending.items():
                 yield RunRequest(
-                    run_key=f"{t.key}/{day}/{context.cursor or ''}",
+                    run_key=f"{t.key}/{key}/{newest_file}",  # a later revision yields a new key, so it is reloaded
                     asset_selection=[table_key(t)],
-                    partition_key=str(day),
+                    partition_key=key,
                 )
 
     return load_sensor
