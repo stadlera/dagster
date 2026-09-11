@@ -1,0 +1,6 @@
+.venv/
+landing/
+manifest.db
+__pycache__/
+.pytest_cache/
+tmp*/
