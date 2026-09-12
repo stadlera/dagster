@@ -77,7 +77,8 @@ def build_check(dataset: Dataset, table: Table, check: Check):
 
     @asset_check(asset=target, name=name, description=f"{type(check).__name__} on {table.key}")
     def run_check(context: AssetCheckExecutionContext, manifest: Manifest, sql: Sql) -> AssetCheckResult:
-        partition = context.run.tags.get("dagster/partition")
+        tags = context.run.tags  # single partition, or the start of a range run
+        partition = tags.get("dagster/partition") or tags.get(ASSET_PARTITION_RANGE_START_TAG)
         result = check.evaluate(CheckContext(manifest, sql, table, date.today(), partition))
         return AssetCheckResult(
             passed=result.passed, severity=AssetCheckSeverity[result.severity], metadata=result.metadata
