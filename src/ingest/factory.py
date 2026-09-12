@@ -24,6 +24,7 @@ from dagster import (
 )
 from dagster._core.storage.tags import ASSET_PARTITION_RANGE_END_TAG, ASSET_PARTITION_RANGE_START_TAG
 
+from ingest.alerting import Notifier, build_alerting
 from ingest.checks import Check, CheckContext
 from ingest.classify import classify
 from ingest.config import Dataset, Table
@@ -39,7 +40,7 @@ def build_raw_asset(dataset: Dataset):
     @asset(
         key=feed.raw_key,
         group_name=feed.name,
-        description=f"Byte-equivalent mirror of {', '.join(feed.paths)}",
+        description=f"Byte-equivalent mirror of {', '.join(f'{k}={v}' for k, v in feed.subsets.items())}",
         required_resource_keys={remote_key, "landing", "manifest"},
         retry_policy=RetryPolicy(max_retries=2, delay=120),
     )
@@ -98,6 +99,7 @@ def build_table_asset(dataset: Dataset, table: Table):
         description=f"{type(table.reader).__name__} via {type(table.writer).__name__}",
         # tables of one dataset share a dlt pipeline; limit this key to 1 in the instance to serialize their loads
         op_tags={"dagster/concurrency_key": f"load_{dataset.name}"},
+        retry_policy=RetryPolicy(max_retries=1, delay=60),
     )
     def sql_table(context: AssetExecutionContext) -> MaterializeResult:
         manifest: Manifest = context.resources.manifest
@@ -107,6 +109,8 @@ def build_table_asset(dataset: Dataset, table: Table):
             return MaterializeResult(metadata={"rows": 0, "files": 0})
         result = load(dataset, table, files, dataset.sql_url or context.resources.sql.url, context.run.run_id)
         manifest.mark_loaded([f.id for f in files], context.run.run_id)
+        if new := result.details.get("new_columns"):
+            context.log.warning("%s: new columns %s, add them to the committed schema", table.key, new)
         return MaterializeResult(metadata={"rows": result.rows, "files": len(files), **result.details})
 
     return sql_table
@@ -153,6 +157,11 @@ def build_dataset(dataset: Dataset) -> Definitions:
     return Definitions.merge(defs, dataset.extra) if dataset.extra else defs
 
 
-def build_definitions(datasets: list[Dataset], landing: Landing, manifest: Manifest, sql: Sql) -> Definitions:
-    shared = Definitions(resources={"landing": landing, "manifest": manifest, "sql": sql})
+def build_definitions(
+    datasets: list[Dataset], landing: Landing, manifest: Manifest, sql: Sql, notifier: Notifier | None = None
+) -> Definitions:
+    shared = Definitions(
+        resources={"landing": landing, "manifest": manifest, "sql": sql, "notifier": notifier or Notifier()},
+        sensors=build_alerting(),
+    )
     return Definitions.merge(shared, *(build_dataset(d) for d in datasets))

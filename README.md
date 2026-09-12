@@ -7,7 +7,7 @@ area, track every file in a manifest, load them into SQL Server with dlt.
 
 One table goes through five stages; each stage is configured by one object on the `Table`:
 
-    1 mirroring       Feed               sync.py         list remote, diff against manifest, download new/changed
+    1 mirroring       Feed.subsets       sync.py         list each subset root, diff against manifest, download new/changed
     2 selection       Table.source       sources.py      Patterns (select/ignore/archives/identity) or your own Source
                                          classify.py     expand archives, match, resolve identity collisions
     3 checks          Table.checks       checks.py       Delivery (calendar + lag + file count) or any Check
@@ -23,6 +23,8 @@ One table goes through five stages; each stage is configured by one object on th
       factory.py           Dataset -> assets, checks, sync schedule, load sensor
       definitions.py       Dagster entry point: shared resources + all discovered datasets
       profile.py           CLI: uv run python -m ingest.profile <feed>/<table>
+      alerting.py          Notifier resource, run-failure and check-failure sensors
+      ops.py               operator helpers: show / reload / ignore / reclassify (also a CLI)
       datasets/<name>/     `dataset = Dataset(...)`, custom Dagster objects, schemas/import/<feed>.schema.yaml
 
 Dagster objects per dataset: one unpartitioned `raw/<feed>` asset (mirror + classify), one partitioned
@@ -42,8 +44,15 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
 
 1. Create `src/ingest/datasets/<name>/__init__.py` exposing a module-level `dataset`:
 
-       feed = Feed(name="acme", cron="0 7 * * 1-5", remote=Remote(protocol="sftp", options={...}),
-                   paths=("/outgoing/prices",), exclude=r"^latest\.csv$")
+       feed = Feed(name="acme", cron="0 7 * * 1-5", exclude=r"^latest\.csv$",
+                   subsets={"prices": "/outgoing/prices", "refdata": "/outgoing/reference"},
+                   remote=Remote(protocol="sftp", options={"host": "sftp.acme.com", "port": "22",
+                                 "username": "us", "password": EnvVar("ACME_PASSWORD")}))
+                   # or key_filename=... ; options are passed to paramiko's SSHClient.connect
+
+   A subset is a remote folder holding distinct data (a sub dataset, a region, ...). Files are keyed
+   as `<subset>/<path below the subset root>` everywhere: in the manifest (`subset`, `path`), in the
+   landing area and in the select patterns. Two subsets never collide, whatever their file names.
        dataset = Dataset(feed, tables=(), schema_dir=Path(__file__).parent / "schemas")
 
    Start with no tables: the sync runs, the manifest fills, and you can look at what actually arrives.
@@ -51,7 +60,8 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
    other stage has a default (daily partitions, CSV, dlt replace-by-day, XLON calendar with one day lag
    and at least one file per day) and is swapped with a builder method:
 
-       Table("acme", "prices", Patterns(under=r"/prices$", select=(r"/(?P<region>apac|emea)/prices-(?P<date>\d{8})\.csv$",), date_format="%Y%m%d"))
+       Table("acme", "prices", Patterns((r"^prices/(?P<region>apac|emea)/prices-(?P<date>\d{8})\.csv$",), date_format="%Y%m%d"),
+             subsets=("prices",))  # only files of these subsets are considered; empty = all
            .with_partitioning(Monthly(start="2024-01-01"))
            .with_reader(CsvReader(delimiter=";", skip_rows=2))
            .with_writer(DltWriter(merge=Upsert(keys=("isin", "as_of"))))
@@ -70,11 +80,12 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
    (20, 50, 100, 255, 1000, else max).
 3. Review the YAML (e.g. keep identifiers with leading zeros as text, widen decimals), commit it.
 4. Loads read with the committed types: CSV via pyarrow column types, JSON coerced by dlt,
-   Parquet/Avro keep their own schema. New columns are added (visible in the export schema and the
-   dlt load info), a changed type fails the load. Widen a column by editing the YAML.
+   Parquet/Avro keep their own schema. New columns are added and reported as `new_columns` in the
+   asset metadata plus a warning in the run log; add them to the YAML. A changed type fails the load.
+   Widen a column by editing the YAML. Without a committed schema dlt infers freely per load.
 
 All tables of a dataset share one dlt pipeline and one SQL schema (`Dataset.sql_schema`, default:
-feed name). Loaded rows carry `_business_date`, `_source_file` (manifest id), `_load_id` (Dagster
+feed name). Loaded rows carry `_business_date`, `_subset`, `_source_file` (manifest id), `_load_id` (Dagster
 run id) and `_<name>` for each named group of the select pattern. Nested JSON is flattened into
 `parent__child` columns and lists into `<table>__<field>` child tables; `DltWriter(max_nesting=N)`
 limits the depth, 0 keeps nested values as json text.
@@ -88,8 +99,18 @@ limits the depth, 0 keeps nested values as json text.
 - **Landing layout** mirrors the remote: `<root>/<feed>/<last path component>/<relative path>[.vN]`.
   A changed remote file is downloaded as a new version; nothing is ever modified or extracted.
 - **Delivery checks** run after every sync on the raw asset, one per table. The newest due occurrence
-  missing is a warning (may be late), anything else an error. Wire a run-failure and check-failure
-  sensor to your alerting.
+  missing is a warning (may be late), anything else an error.
+- **Alerting**: two sensors send email through the `Notifier` resource: `alert_run_failures`, and
+  `alert_run_findings` for successful runs that carry failed checks (severity ERROR; warnings are only
+  logged) or schema changes (new columns accepted by the contract). Configure
+  `INGEST_SMTP_HOST`, `INGEST_SMTP_PORT` (25), `INGEST_SMTP_FROM`, `INGEST_ALERT_TO` (comma separated),
+  optionally `INGEST_SMTP_USER` / `INGEST_SMTP_PASSWORD` for STARTTLS login. Without a host it only
+  logs. Turn the sensors on in the Dagster UI.
+- **Manual interventions**: reloading is materializing the partition or range in the UI. For the rest
+  `uv run python -m ingest.ops ...`: `reload <table> <start> [<end>]` marks a date range as not loaded
+  so the load sensor requests it again; `ignore <id...>` takes files out of loading (ids from the
+  manifest); `reclassify <table>` forgets the table's assignments so the next sync re-runs changed
+  patterns.
 - **Partitions**: `Table.partitioning` is `Daily()` (default), `Weekly()`, `Monthly()`, `Yearly()` or
   `Partitioning(<any TimeWindowPartitionsDefinition>)`. Loads use a single-run backfill policy: the
   load sensor groups pending partitions into contiguous ranges (`max_per_run`) and one run loads the
@@ -100,8 +121,10 @@ limits the depth, 0 keeps nested values as json text.
 
 ## Logical files, archives and collisions
 
-Every classified row gets an `identity`: by default file name + business date + named groups, so a
-file keeps its identity when it is moved (retention folders) or repacked into an archive.
+Every classified row gets an `identity`: by default subset + file name + business date + named groups,
+so a file keeps its identity when it is moved within its subset (retention folders) or repacked into
+an archive. `Patterns(identity=across_subsets)` drops the subset for providers that move files between
+folders declared as separate subsets (`output/` -> `history-a/`): the moved copy is then a duplicate.
 `Patterns(identity=fn(match, path) -> str)` overrides the rule (e.g. to treat `x_corrected.csv` as a
 restatement of `x.csv`), or a custom Source decides entirely.
 

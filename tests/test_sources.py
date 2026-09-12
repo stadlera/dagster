@@ -21,29 +21,29 @@ def test_business_date_from_named_group_or_group_one_and_date_formats():
 
 def test_named_groups_become_attributes_and_identity_includes_name_date_and_attributes():
     src = Patterns((r"/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",))
-    c = src.classify("/out/EM/apac/em-2026-09-08.csv")
+    c = src.classify("EM/apac/em-2026-09-08.csv")
     assert c.attributes == {"region": "apac"}
-    assert c.identity == "em-2026-09-08.csv|2026-09-08|region=apac"
+    assert c.identity == "EM|em-2026-09-08.csv|2026-09-08|region=apac"
     assert src.attribute_names == ("region",)
-    assert default_identity("/a/b.csv", date(2026, 1, 1), {}) == "b.csv|2026-01-01"
+    assert default_identity("EM/a/b.csv", date(2026, 1, 1), {}) == "EM|b.csv|2026-01-01"
 
 
-def test_under_ignore_and_no_match():
-    src = Patterns((r"em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",), under=r"/EM$", ignore=(r"\.tmp\.",))
-    assert src.classify("/out/EM/em-2026-09-08.csv")
-    assert src.classify("/out/EM/archive/em-2026-09-08.csv") is None  # narrowed away by `under`
-    assert src.classify("/out/EM/em-2026-09-08.tmp.csv") is None
-    assert src.classify("/out/EM/other.csv") is None
+def test_ignore_anchoring_and_no_match():
+    src = Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",), ignore=(r"\.tmp\.",))
+    assert src.classify("EM/em-2026-09-08.csv")
+    assert src.classify("EM/archive/em-2026-09-08.csv") is None  # anchored on the subset root
+    assert src.classify("EM/em-2026-09-08.tmp.csv") is None
+    assert src.classify("EM/other.csv") is None
 
 
 def test_custom_identity_and_archive_detection():
     src = Patterns(
         (r"em-(?P<date>\d{4}-\d{2}-\d{2})(?P<suffix>_corrected)?\.csv$",),
         identity=lambda m, path: m.group("date"),
-        archives=(r"/em-\d{4}\.zip$",),
+        archives=(r"^EM/em-\d{4}\.zip$",),
     )
     assert src.classify("/x/em-2026-09-08.csv").identity == src.classify("/x/em-2026-09-08_corrected.csv").identity
-    assert src.expands("/x/em-2026.zip") and not src.expands("/x/em-2026-09-08.csv")
+    assert src.expands("EM/em-2026.zip") and not src.expands("EM/em-2026-09-08.csv")
 
 
 class ContentDateSource:
@@ -64,3 +64,10 @@ class ContentDateSource:
 
 def test_protocol_allows_a_custom_source():
     assert ContentDateSource().classify("/x/snapshot_7.csv").identity == "snapshot-7"
+
+
+def test_a_pattern_without_a_date_group_is_rejected_clearly():
+    import pytest
+
+    with pytest.raises(ValueError, match="date"):
+        Patterns((r"em\.csv$",)).classify("/x/em.csv")

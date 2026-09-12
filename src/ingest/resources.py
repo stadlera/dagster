@@ -13,13 +13,23 @@ from pydantic import PrivateAttr
 
 
 class Remote(ConfigurableResource):
-    """Any fsspec filesystem: sftp, file, s3, ... Options are passed through."""
+    """Any fsspec filesystem: sftp, file, s3, ... Options are passed through to the backend
+    (sftp: host, port, username, password, key_filename, ... as paramiko's SSHClient.connect takes them).
+    Dagster config keeps them as strings; digits become ints and true/false booleans."""
 
     protocol: str
     options: dict[str, str] = {}
 
     def fs(self) -> fsspec.AbstractFileSystem:
-        return fsspec.filesystem(self.protocol, **self.options)
+        return fsspec.filesystem(self.protocol, **{k: _coerce(v) for k, v in self.options.items()})
+
+
+def _coerce(value: str):
+    if value.isdigit():
+        return int(value)
+    if value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    return value
 
 
 class Sql(ConfigurableResource):
@@ -31,10 +41,10 @@ class Sql(ConfigurableResource):
 class Landing(ConfigurableResource):
     root: str
 
-    def path(self, feed: str, relative: str, version: int) -> Path:
-        """Mirror the remote layout: <root>/<feed>/<path relative to the feed path>[.vN]."""
+    def path(self, feed: str, logical_path: str, version: int) -> Path:
+        """Mirror the remote layout: <root>/<feed>/<subset>/<path below the subset root>[.vN]."""
         suffix = f".v{version}" if version > 1 else ""
-        return Path(self.root, feed, relative + suffix)
+        return Path(self.root, feed, logical_path + suffix)
 
 
 class FileStatus(str, Enum):
@@ -52,7 +62,9 @@ files = sa.Table(
     metadata,
     sa.Column("id", sa.Integer, primary_key=True),
     sa.Column("feed", sa.String(100), nullable=False, index=True),
-    sa.Column("remote_path", sa.String(1000), nullable=False),
+    sa.Column("subset", sa.String(100), nullable=False),
+    sa.Column("remote_path", sa.String(1000), nullable=False),  # as listed on the remote (audit, sync diff)
+    sa.Column("path", sa.String(1000), nullable=False),  # logical: <subset>/<below subset root>[!<member>]
     sa.Column("remote_mtime", sa.String(40)),
     sa.Column("size", sa.BigInteger),
     sa.Column("version", sa.Integer, nullable=False, default=1),
@@ -119,7 +131,9 @@ class Manifest(ConfigurableResource):
                 conn.execute(
                     sa.insert(files).values(
                         feed=archive.feed,
+                        subset=archive.subset,
                         remote_path=f"{archive.remote_path}!{m.name}",
+                        path=f"{archive.path}!{m.name}",
                         remote_mtime=archive.remote_mtime,
                         size=m.size,
                         version=archive.version,

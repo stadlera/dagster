@@ -1,6 +1,7 @@
 """Static description of what we ingest.
 
-Feed    = stage 1, mirroring: one provider connection and the remote paths we copy. Configured upfront.
+Feed    = stage 1, mirroring: one provider connection and its named subsets (remote folders that hold
+          distinct data). Configured upfront. Files are keyed as <subset>/<path below the subset root>.
 Table   = one SQL table, composed of one object per stage:
             source        stage 2  which mirrored files, business date, identity, archives, collisions
             checks        stage 3  delivery expectation and any other Check
@@ -15,6 +16,7 @@ Dataset.sync_schedule_name, Dataset.load_sensor_name) so custom definitions can 
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -33,9 +35,14 @@ class Feed:
     name: str
     remote: Remote
     cron: str
-    paths: tuple[str, ...]
+    subsets: dict[str, str]  # subset name -> remote root, e.g. {"EM": "/out/EM", "Platform": "/out/Platform"}
     maxdepth: int | None = 1
     exclude: str | None = None  # files matching this are never downloaded
+
+    def __post_init__(self) -> None:
+        bad = [n for n in self.subsets if not re.fullmatch(r"[A-Za-z0-9_.-]+", n)]
+        if bad or not self.subsets:
+            raise ValueError(f"feed {self.name}: subset names must be simple folder names, got {bad or 'none'}")
 
     @property
     def raw_key(self) -> AssetKey:
@@ -47,6 +54,7 @@ class Table:
     feed: str
     name: str
     source: Source
+    subsets: tuple[str, ...] = ()  # feed subsets this table draws from; empty = all of them
     checks: tuple[Check, ...] = (Delivery(),)
     partitioning: Partitioning = field(default_factory=Daily)
     reader: Reader = field(default_factory=CsvReader)
@@ -98,6 +106,8 @@ class Dataset:
         for t in self.tables:
             if t.feed != self.feed.name:
                 raise ValueError(f"table {t.key} does not belong to feed {self.feed.name}")
+            if unknown := set(t.subsets) - set(self.feed.subsets):
+                raise ValueError(f"table {t.key} references unknown subsets {sorted(unknown)}")
 
     @property
     def name(self) -> str:

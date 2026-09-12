@@ -15,9 +15,8 @@ from ingest.resources import Landing, Manifest, Remote, Sql
 from ingest.sources import Patterns
 
 PRICES = Patterns(
-    under=r"/prices",
     select=(r"/(?P<region>apac|emea)/prices-(?P<date>\d{8})\.csv$",),
-    archives=(r"/history/prices-\d{4}\.zip$",),
+    archives=(r"^prices/history/prices-\d{4}\.zip$",),
     date_format="%Y%m%d",
 )
 
@@ -63,7 +62,12 @@ def test_two_days_in_the_life_of_a_provider(tmp_path):
         z.writestr("apac/prices-20251231.csv", csv(("XS1", 0.6)))
 
     feed = Feed(
-        "acme", Remote(protocol="file"), "0 7 * * 1-5", (str(provider.root),), maxdepth=3, exclude=r"^latest\.csv$"
+        "acme",
+        Remote(protocol="file"),
+        "0 7 * * 1-5",
+        {"prices": str(provider.root)},
+        maxdepth=3,
+        exclude=r"^latest\.csv$",
     )
     table = (
         Table("acme", "prices", PRICES, partitioning=Daily(start="2025-01-01"))

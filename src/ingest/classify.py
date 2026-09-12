@@ -25,8 +25,9 @@ def classify(manifest: Manifest, dataset: Dataset) -> int:
     expand_archives(manifest, dataset)
     assigned, ambiguous = 0, []
     for row in manifest.unclassified(dataset.name):
-        path = match_path(row.remote_path)
-        matches = [(t, c) for t in dataset.tables if (c := t.source.classify(path))]
+        path = match_path(row.path)
+        candidates = [t for t in dataset.tables if not t.subsets or row.subset in t.subsets]
+        matches = [(t, c) for t in candidates if (c := t.source.classify(path))]
         if len(matches) > 1:
             ambiguous.append((row.remote_path, [t.key for t, _ in matches]))
             continue
@@ -44,7 +45,8 @@ def classify(manifest: Manifest, dataset: Dataset) -> int:
 
 def expand_archives(manifest: Manifest, dataset: Dataset) -> None:
     for row in manifest.unclassified(dataset.name, top_level=True):
-        if any(t.source.expands(row.remote_path) for t in dataset.tables):
+        tables = [t for t in dataset.tables if not t.subsets or row.subset in t.subsets]
+        if any(t.source.expands(row.path) for t in tables):
             manifest.add_members(row, list_members(row.local_path))
 
 
@@ -60,9 +62,9 @@ def resolve_collision(manifest: Manifest, table: Table, row, identity: str) -> F
     return FileStatus.DOWNLOADED
 
 
-def match_path(remote_path: str) -> str:
+def match_path(path: str) -> str:
     """'<archive>!<member>' is matched as '<archive dir>/<member>', as if unpacked in place."""
-    if "!" not in remote_path:
-        return remote_path
-    archive, member = remote_path.split("!", 1)
+    if "!" not in path:
+        return path
+    archive, member = path.split("!", 1)
     return posixpath.join(posixpath.dirname(archive), member)

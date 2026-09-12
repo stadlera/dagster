@@ -15,7 +15,7 @@ import dlt
 import pyarrow as pa
 from dlt.common.libs.pyarrow import get_py_arrow_datatype
 
-from ingest.schema import committed_types
+from ingest.schema import committed_schema, committed_types, schema_path
 
 if TYPE_CHECKING:
     from ingest.config import Dataset, Table
@@ -42,7 +42,7 @@ class WriteResult:
 
 
 class Writer(Protocol):
-    def column_types(self, dataset: Dataset, table: Table) -> dict[str, pa.DataType]:
+    def column_types(self, dataset: Dataset, table: Table, sql_url: str) -> dict[str, pa.DataType]:
         """Committed types the reader should read with (empty: infer)."""
         ...
 
@@ -77,10 +77,14 @@ class DltWriter:
             return dlt.destinations.mssql(credentials=url)
         return dlt.destinations.sqlalchemy(credentials=url)
 
-    def column_types(self, dataset, table):
-        return committed_types(dataset, table, self.destination("sqlite://").capabilities())
+    def column_types(self, dataset, table, sql_url):
+        return committed_types(dataset, table, self.destination(sql_url).capabilities())
 
     def write(self, ctx: WriteContext, batches) -> WriteResult:
+        with tempfile.TemporaryDirectory(prefix="dlt_") as workdir:
+            return self._write(ctx, batches, workdir)
+
+    def _write(self, ctx: WriteContext, batches, workdir: str) -> WriteResult:
         dest = self.destination(ctx.sql_url)
         caps = dest.capabilities()
         fields = [
@@ -103,19 +107,26 @@ class DltWriter:
             for meta, batch in batches:
                 yield with_metadata(batch, meta, fields)
 
+        committed = committed_schema(ctx.dataset)
         pipeline = dlt.pipeline(
             pipeline_name=ctx.dataset.schema_name,
-            pipelines_dir=tempfile.mkdtemp(prefix="dlt_"),  # state lives in the destination, not on this pod
+            pipelines_dir=workdir,  # state lives in the destination, not on this pod
             destination=dest,
             dataset_name=ctx.dataset.schema_name,
-            import_schema_path=str(ctx.dataset.schema_dir / "import"),
-            export_schema_path=str(ctx.dataset.schema_dir / "export"),
+            # a committed schema is authoritative; without one dlt infers and the profiler seeds the file later
+            import_schema_path=str(schema_path(ctx.dataset).parent) if committed else None,
         )
         info = pipeline.run(rows())
         info.raise_on_failed_jobs()
         counts = pipeline.last_trace.last_normalize_info.row_counts
         rows_loaded = sum(v for k, v in counts.items() if not k.startswith("_dlt"))
-        return WriteResult(rows=rows_loaded, details={"dlt_load_ids": info.loads_ids})
+        details = {"dlt_load_ids": info.loads_ids}
+        if committed and ctx.table.name in committed.tables:
+            known = set(committed.tables[ctx.table.name].get("columns", {}))
+            loaded = set(pipeline.default_schema.get_table_columns(ctx.table.name))
+            if new := sorted(loaded - known - set(ctx.metadata_columns) - {"_dlt_load_id", "_dlt_id"}):
+                details["new_columns"] = new  # added by the evolve contract; commit them to the schema
+        return WriteResult(rows=rows_loaded, details=details)
 
 
 def with_metadata(batch: Batch, meta: dict, fields: list[pa.Field]) -> Batch:

@@ -17,11 +17,11 @@ from ingest.writers import DltWriter, Upsert
 
 REGIONAL = Patterns(
     (
-        r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-        r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        r"^EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
     )
 )
-JSON = Patterns((r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.json$",))
+JSON = Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.json$",))
 
 
 def test_rows_carry_metadata_and_reloads_do_not_duplicate(ws):
@@ -37,7 +37,7 @@ def test_rows_carry_metadata_and_reloads_do_not_duplicate(ws):
         ("XS1", 2.0, "2026-09-09", 2, "run-2"),
         ("XS2", 3.0, "2026-09-09", 2, "run-2"),
     ]
-    assert list(metadata_columns(table)) == ["_business_date", "_source_file", "_load_id"]
+    assert list(metadata_columns(table)) == ["_business_date", "_subset", "_source_file", "_load_id"]
 
 
 def test_restated_partition_replaces_only_its_business_date(ws):
@@ -94,7 +94,7 @@ def test_nested_json_is_flattened_and_unnested_or_kept_as_json(ws):
 
     ws.write_remote("bonds-2026-09-12.json", NESTED)
     ws.sync()
-    flat_source = Patterns((r"/bonds-(?P<date>\d{4}-\d{2}-\d{2})\.json$",))
+    flat_source = Patterns((r"^EM/bonds-(?P<date>\d{4}-\d{2}-\d{2})\.json$",))
     flat = ws.table("bonds_flat", source=flat_source).with_reader(JsonReader()).with_writer(DltWriter(max_nesting=0))
     ws.classify(table, flat)
     ws.load(flat, date(2026, 9, 12))
@@ -110,8 +110,9 @@ def test_schema_contract_adds_columns_but_rejects_type_changes(ws):
     table = ws.table("px", source=JSON).with_reader(JsonReader())
     ws.classify(table)
     ws.load(table, date(2026, 9, 12))
-    ws.load(table, date(2026, 9, 13))  # new column: added
+    result = ws.load(table, date(2026, 9, 13))  # new column: added, and reported once a schema is committed
     assert ws.query("select isin, currency from px order by isin") == [("XS1", None), ("XS2", "EUR")]
+    assert "new_columns" not in result.details
     with pytest.raises(PipelineStepFailed, match="price"):  # float -> text: refused, nothing written
         ws.load(table, date(2026, 9, 14))
     assert ws.query("select count(*) from px") == [(2,)]
@@ -141,8 +142,16 @@ def test_profile_proposes_a_schema_and_loads_read_with_the_committed_types(ws):
     path.write_text(path.read_text().replace("data_type: bigint", "data_type: text\n        precision: 20"))
     caps = dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities()
     assert committed_types(dataset, table, caps)["id"].equals(__import__("pyarrow").string())
+    assert table.writer.column_types(dataset, table, ws.sql_url)["id"].equals(__import__("pyarrow").string())
     ws.load(table, date(2026, 9, 8))
     assert ws.query("select id, price from em order by id") == [("00123", 1.5), ("7", 12.345)]
+    # a column the provider added after the schema was committed is loaded and reported
+    ws.write_remote(
+        "em-2026-09-09.csv", b"id,isin,price,as_of,note,currency\n8,XS3,1.0,2026-09-09,x,EUR\n", bump_mtime=True
+    )
+    ws.sync()
+    ws.classify(table)
+    assert ws.load(table, date(2026, 9, 9)).details["new_columns"] == ["currency"]
     # profiling another table keeps the first one in the shared dataset schema
     other = ws.table("em2")
     write_schema(profile(dataset, other, ws.manifest.files_for(table.key, date(2026, 9, 8))), dataset)

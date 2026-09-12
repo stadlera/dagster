@@ -11,10 +11,28 @@ from ingest.sources import Patterns
 BY_NAME = Patterns((r"em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",))  # any folder, also archive members
 REGIONAL = Patterns(
     (
-        r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-        r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        r"^EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
     )
 )
+
+
+def test_tables_only_see_their_subsets(ws):
+    other = ws.remote.parent / "Platform"
+    other.mkdir()
+    (other / "em-2026-09-08.csv").write_bytes(CSV_08)  # same name as in EM, distinct data
+    from dataclasses import replace
+
+    feed = replace(ws.feed, subsets={"EM": str(ws.remote), "Platform": str(other)})
+    ws.sync(feed)
+    em = ws.table(source=BY_NAME, subsets=("EM",))
+    platform = ws.table("platform", source=BY_NAME, subsets=("Platform",))
+    from ingest.classify import classify
+    from ingest.config import Dataset
+
+    assert classify(ws.manifest, Dataset(feed, (em, platform), schema_dir=ws.tmp)) == 3
+    assert len(ws.manifest.files_for(em.key, date(2026, 9, 8))) == 1
+    assert len(ws.manifest.files_for(platform.key, date(2026, 9, 8))) == 1  # same name: no collision across subsets
 
 
 def test_tables_can_be_defined_after_the_files_were_mirrored(ws):
@@ -50,7 +68,7 @@ def test_yearly_archive_members_fill_gaps_dedupe_and_restate(ws):
         z.writestr("em-2026-09-08.csv", CSV_08)  # identical repack of the daily file
         z.writestr("em-2026-09-09.csv", b"isin,price\nXS1,9.9\n")  # restated
     ws.sync()
-    table = ws.table(source=Patterns((r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",), archives=(r"/em-\d{4}\.zip$",)))
+    table = ws.table(source=Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",), archives=(r"^EM/em-\d{4}\.zip$",)))
     assert ws.classify(table) == 5
 
     st = ws.statuses()
@@ -117,3 +135,28 @@ def test_revision_of_the_same_remote_path_supersedes_and_becomes_pending_again(w
     ws.classify(table)
     pending = ws.manifest.pending_days(table.key)
     assert set(pending) == {date(2026, 9, 8), date(2026, 9, 9)} and pending[date(2026, 9, 9)] > 2
+
+
+def test_files_moved_between_subsets_dedupe_with_the_across_subsets_identity(ws):
+    from dataclasses import replace
+
+    from ingest.classify import classify
+    from ingest.config import Dataset
+    from ingest.sources import across_subsets
+
+    output, history = ws.remote.parent / "output", ws.remote.parent / "history-a"
+    output.mkdir(), history.mkdir()
+    (output / "a-2026-09-08.csv").write_bytes(CSV_08)
+    feed = replace(ws.feed, subsets={"output": str(output), "history-a": str(history)})
+    patterns = Patterns((r"^(output|history-a)/a-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",), identity=across_subsets)
+    table = ws.table("a", source=patterns, subsets=("output", "history-a"))
+    dataset = Dataset(feed, (table,), schema_dir=ws.tmp)
+    ws.sync(feed)
+    classify(ws.manifest, dataset)
+
+    (output / "a-2026-09-08.csv").rename(history / "a-2026-09-08.csv")  # provider moves it after retention
+    ws.sync(feed)
+    classify(ws.manifest, dataset)
+    st = {p.rsplit("/", 2)[-2]: status for p, status in ws.statuses().items() if p.endswith("a-2026-09-08.csv")}
+    assert st == {"output": "downloaded", "history-a": "duplicate"}
+    assert len(ws.manifest.files_for(table.key, date(2026, 9, 8))) == 1

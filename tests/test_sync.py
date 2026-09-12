@@ -1,6 +1,7 @@
 """Stage 1, mirroring: byte-equivalent copies, idempotent reruns, versions, exclusions."""
 
 import gzip
+from dataclasses import replace
 from datetime import date
 
 from conftest import CSV_08, CSV_09, deeper
@@ -55,10 +56,26 @@ def test_subfolders_need_maxdepth_and_compressed_files_stay_compressed(ws):
     assert ws.landing.path("tradeweb", "EM/em-2026-09-10.csv.gz", 1).read_bytes() == gzip.compress(CSV_08)
 
 
-def test_multiple_remote_paths_land_under_their_last_component(ws):
-    other = ws.remote.parent / "Platform"
-    other.mkdir()
+def test_subsets_land_under_their_name_and_are_recorded(ws):
+    other = ws.remote.parent / "some" / "deep" / "folder"
+    other.mkdir(parents=True)
     (other / "pf-2026-09-08.csv").write_bytes(CSV_08)
-    feed = ws.feed.__class__(**{**ws.feed.__dict__, "paths": (str(ws.remote), str(other))})
+    feed = replace(ws.feed, subsets={"EM": str(ws.remote), "platform": str(other)})
     assert len(ws.sync(feed).downloaded) == 3
-    assert ws.landing.path("tradeweb", "Platform/pf-2026-09-08.csv", 1).exists()
+    assert ws.landing.path("tradeweb", "platform/pf-2026-09-08.csv", 1).exists()
+    rows = ws.manifest.unclassified("tradeweb")
+    assert {(r.subset, r.path) for r in rows} >= {
+        ("platform", "platform/pf-2026-09-08.csv"),
+        ("EM", "EM/em-2026-09-08.csv"),
+    }
+
+
+def test_subset_names_are_validated_and_remote_options_are_coerced():
+    import pytest
+
+    from ingest.config import Feed
+    from ingest.resources import Remote, _coerce
+
+    with pytest.raises(ValueError, match="subset names"):
+        Feed("x", Remote(protocol="file"), "0 7 * * *", {"a/b": "/out"})
+    assert _coerce("22") == 22 and _coerce("true") is True and _coerce("sftp.acme.com") == "sftp.acme.com"

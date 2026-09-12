@@ -40,7 +40,7 @@ def test_keys_and_extra_definitions_wire_into_the_factory(ws):
     assert graph.get(AssetKey("em_report")).parent_keys == {table.asset_key}
     assert {c.name for c in graph.asset_check_keys} == {"delivery_em", "row_count"}
     assert defs.resolve_schedule_def(dataset.sync_schedule_name).cron_schedule == "0 7 * * 1-5"
-    assert set(defs.resources) == {"landing", "manifest", "sql", "remote_tradeweb"}
+    assert set(defs.resources) == {"landing", "manifest", "sql", "notifier", "remote_tradeweb"}
 
 
 def test_raw_asset_syncs_classifies_and_runs_checks(ws):

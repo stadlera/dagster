@@ -26,7 +26,7 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
     result = SyncResult()
     known = manifest.latest(feed.name)
 
-    for base in feed.paths:
+    for subset, base in feed.subsets.items():
         base = base.rstrip("/")
         for info in fs.find(base, maxdepth=feed.maxdepth, detail=True).values():
             if info.get("type") != "file":
@@ -40,7 +40,9 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
                 if prev is None:
                     manifest.record(
                         feed=feed.name,
+                        subset=subset,
                         remote_path=remote_path,
+                        path=f"{subset}/{posixpath.relpath(remote_path, base)}",
                         remote_mtime=mtime,
                         size=size,
                         status=FileStatus.IGNORED,
@@ -52,8 +54,8 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
                 continue
 
             version = prev.version + 1 if prev is not None else 1
-            relative = posixpath.join(posixpath.basename(base), posixpath.relpath(remote_path, base))
-            local = landing.path(feed.name, relative, version)
+            logical = f"{subset}/{posixpath.relpath(remote_path, base)}"
+            local = landing.path(feed.name, logical, version)
             local.parent.mkdir(parents=True, exist_ok=True)
             tmp = local.with_name(local.name + ".part")
             fs.get_file(remote_path, str(tmp))
@@ -61,7 +63,9 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
 
             manifest.record(
                 feed=feed.name,
+                subset=subset,
                 remote_path=remote_path,
+                path=logical,
                 remote_mtime=mtime,
                 size=size,
                 version=version,

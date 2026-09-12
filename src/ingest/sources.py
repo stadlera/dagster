@@ -1,10 +1,11 @@
 """Stage 2, selection: which mirrored files belong to a table, their business date and logical identity.
 
-A Source is asked two questions per file path: `expands(path)` for archives that hold several logical
-files (members are then classified individually), and `classify(path)` which returns a Classified or
-None. Archive members are classified on their virtual path, the member name placed next to the archive
-(<archive dir>/<member>), so the same select patterns match plain files and repacked ones.
-Implement the protocol for providers whose naming cannot be expressed as patterns.
+A Source is asked two questions per logical path `<subset>/<path below the subset root>`: `expands(path)`
+for archives that hold several logical files (members are then classified individually), and
+`classify(path)` which returns a Classified or None. Archive members are classified on their virtual
+path, the member name placed next to the archive (<archive dir>/<member>), so the same select patterns
+match plain files and repacked ones. Implement the protocol for providers whose naming cannot be
+expressed as patterns.
 """
 
 from __future__ import annotations
@@ -36,11 +37,10 @@ class Source(Protocol):
 
 @dataclass(frozen=True)
 class Patterns:
-    """Default source: regexes on the remote path. The business date is the named group `date` (or group 1),
-    every other named group is an attribute. `under` narrows by directory before the select patterns run."""
+    """Default source: regexes on the logical path `<subset>/<relative path>`. The business date is the
+    named group `date` (or group 1), every other named group is an attribute."""
 
     select: tuple[str, ...]
-    under: str | None = None  # regex on the directory part, e.g. r"/EM(/|$)"
     ignore: tuple[str, ...] = ()
     archives: tuple[str, ...] = ()  # archives holding several logical files; members are classified individually
     date_format: str = "%Y-%m-%d"
@@ -53,25 +53,34 @@ class Patterns:
         return tuple(sorted(names))
 
     def expands(self, path: str) -> bool:
-        return self._under(path) and any(re.search(p, path) for p in self.archives)
+        return any(re.search(p, path) for p in self.archives)
 
     def classify(self, path: str) -> Classified | None:
-        if not self._under(path) or any(re.search(p, path) for p in self.ignore):
+        if any(re.search(p, path) for p in self.ignore):
             return None
         match = next((m for p in self.select if (m := re.search(p, path))), None)
         if match is None:
             return None
         groups = match.groupdict()
-        raw_date = groups.pop("date", None) or match.group(1)
+        raw_date = groups.pop("date", None) or (match.group(1) if match.groups() else None)
+        if raw_date is None:
+            raise ValueError(f"select pattern {match.re.pattern!r} needs a (?P<date>...) group or a first group")
         day = datetime.strptime(raw_date, self.date_format).date()
         identity = self.identity(match, path) if self.identity else default_identity(path, day, groups)
         return Classified(day, groups, identity)
 
-    def _under(self, path: str) -> bool:
-        return self.under is None or re.search(self.under, posixpath.dirname(path)) is not None
+
+def across_subsets(match: re.Match, path: str) -> str:
+    """Identity rule without the subset: use it when a provider moves files between folders that are
+    declared as different subsets (e.g. output/ -> history-a/), so the moved copy is a duplicate."""
+    groups = match.groupdict()
+    groups.pop("date", None)
+    return "|".join([posixpath.basename(path), *(f"{k}={v}" for k, v in sorted(groups.items()))])
 
 
 def default_identity(path: str, day: date, attributes: dict[str, str]) -> str:
-    """File name + business date + attributes: survives moves and repacks, keeps differently named
-    files of one day apart. A restatement under a new name needs a custom identity function."""
-    return "|".join([posixpath.basename(path), str(day), *(f"{k}={v}" for k, v in sorted(attributes.items()))])
+    """Subset + file name + business date + attributes: survives moves and repacks inside a subset and keeps
+    differently named files of one day apart. A restatement under a new name, or a move between subsets,
+    needs a custom identity function."""
+    subset, name = path.split("/", 1)[0], posixpath.basename(path)
+    return "|".join([subset, name, str(day), *(f"{k}={v}" for k, v in sorted(attributes.items()))])

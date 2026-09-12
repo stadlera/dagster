@@ -18,12 +18,12 @@ feed = Feed(
     # production:
     # Remote(protocol="sftp", options={"host": ..., "username": ..., "password": EnvVar("TRADEWEB_PASSWORD")})
     remote=Remote(protocol="file"),
-    paths=(f"{REMOTE_ROOT}/EM",),
+    subsets={"EM": f"{REMOTE_ROOT}/EM"},
     exclude=r"^em\.csv$",  # static copy of the latest file, would duplicate the dated one
 )
 
 tables = (
-    Table("tradeweb", "em", Patterns(under=r"/EM$", select=(r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",)))
+    Table("tradeweb", "em", Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",)), subsets=("EM",))
     .with_partitioning(Daily(start="2026-09-01"))
     .with_expectation(ExchangeCalendar("XLON", lag_days=1).with_files(exactly=1)),
 )

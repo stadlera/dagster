@@ -19,7 +19,7 @@ from ingest.resources import Landing, Manifest, Remote, files
 from ingest.sources import Patterns
 from ingest.sync import sync
 
-DAILY = Patterns((r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv(\.zip|\.gz)?$",))
+DAILY = Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv(\.zip|\.gz)?$",))
 CSV_08 = b"isin,price\nXS1,1.0\n"
 CSV_09 = b"isin,price\nXS1,2.0\nXS2,3.0\n"
 
@@ -80,7 +80,7 @@ def ws(tmp_path) -> Workspace:
     (remote / "em-2026-09-08.csv").write_bytes(CSV_08)
     (remote / "em-2026-09-09.csv").write_bytes(CSV_09)
     (remote / "em.csv").write_bytes(CSV_09)  # static "latest" copy, excluded by the feed
-    feed = Feed("tradeweb", Remote(protocol="file"), "0 7 * * 1-5", (str(remote),), exclude=r"^em\.csv$")
+    feed = Feed("tradeweb", Remote(protocol="file"), "0 7 * * 1-5", {"EM": str(remote)}, exclude=r"^em\.csv$")
     return Workspace(
         tmp=tmp_path,
         remote=remote,
