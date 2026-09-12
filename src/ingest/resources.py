@@ -22,6 +22,13 @@ class Remote(ConfigurableResource):
         return fsspec.filesystem(self.protocol, **self.options)
 
 
+class Sql(ConfigurableResource):
+    """Target database for loaded tables: any sqlalchemy url, mssql+pyodbc://... in production."""
+
+    url: str
+    dataset_name: str = "raw"
+
+
 class Landing(ConfigurableResource):
     root: str
 
@@ -106,7 +113,9 @@ class Manifest(ConfigurableResource):
                     raw_date = groups.pop("date", None) or m.group(1)
                     day = datetime.strptime(raw_date, t.date_format).date()
                     conn.execute(
-                        sa.update(files).where(files.c.id == row.id).values(table=t.key, business_date=day, attributes=groups)
+                        sa.update(files)
+                        .where(files.c.id == row.id)
+                        .values(table=t.key, business_date=day, attributes=groups)
                     )
                     assigned += 1
         if ambiguous:
@@ -116,9 +125,16 @@ class Manifest(ConfigurableResource):
     def files_for(self, table: str, start: date, end: date | None = None) -> list[sa.Row]:
         """Downloaded files with start <= business_date < end (end defaults to the day after start)."""
         end = end or start + timedelta(days=1)
-        stmt = sa.select(files).where(
-            files.c.table == table, files.c.business_date >= start, files.c.business_date < end, files.c.status == "downloaded"
-        ).order_by(files.c.business_date, files.c.id)
+        stmt = (
+            sa.select(files)
+            .where(
+                files.c.table == table,
+                files.c.business_date >= start,
+                files.c.business_date < end,
+                files.c.status == "downloaded",
+            )
+            .order_by(files.c.business_date, files.c.id)
+        )
         with self.engine().connect() as conn:
             return conn.execute(stmt).all()
 

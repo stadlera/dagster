@@ -1,8 +1,8 @@
-"""Load the files of one table and one business date into SQL via dlt.
+"""Load the files of one table and one partition window into SQL via dlt.
 
 Every row gets _business_date, _source_file (manifest id), _load_id (the Dagster run id) and one
-_<name> column per named group in the select pattern. A reload of a business date replaces that
-date (delete-insert on _business_date) unless the table merges on a business key (upsert).
+_<name> column per named group in the select pattern. A reload replaces the business dates it
+contains (delete-insert on _business_date) unless the table merges on a business key (Upsert).
 """
 
 from __future__ import annotations
@@ -10,20 +10,19 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from datetime import date
 from pathlib import Path
 from typing import BinaryIO, Iterator
 
 import dlt
 import fsspec
 import pyarrow as pa
+from dlt.common.libs.pyarrow import get_py_arrow_datatype
 
 from ingest.config import Table, Upsert
-from ingest.schema import committed_types, schema_name
+from ingest.schema import committed_types
 
 # keep provider column names, only fix characters that are illegal in SQL identifiers
 os.environ.setdefault("SCHEMA__NAMING", "sql_cs_v1")
-SCHEMA_DIR = Path(__file__).parent.parent.parent / "schemas"
 
 # new tables and columns are added automatically, a changed data type fails the load
 CONTRACT = {"tables": "evolve", "columns": "evolve", "data_type": "freeze"}
@@ -37,18 +36,23 @@ def destination(url: str):
     return dlt.destinations.sqlalchemy(credentials=url)
 
 
-def load(table: Table, files: list, destination_url: str, dataset_name: str, load_id: str, schema_dir: Path = SCHEMA_DIR) -> dict:
+def load(table: Table, files: list, destination_url: str, dataset_name: str, load_id: str, schema_dir: Path) -> dict:
     """files: manifest rows (need .id, .local_path, .business_date, .attributes). Returns dlt load metrics."""
     upsert = isinstance(table.merge, Upsert)
     dest = destination(destination_url)
-    column_types = committed_types(table, schema_dir, dest.capabilities())
+    caps = dest.capabilities()
+    column_types = committed_types(table, schema_dir, caps)
 
-    columns = {
+    metadata_columns = {
         "_business_date": {"data_type": "date", "nullable": False},
         "_source_file": {"data_type": "bigint", "nullable": False},
         "_load_id": {"data_type": "text", "nullable": False},
         **{f"_{k}": {"data_type": "text", "nullable": True} for k in table.attribute_names},
     }
+    metadata_fields = [
+        pa.field(name, get_py_arrow_datatype(col, caps, "UTC"), nullable=col["nullable"])
+        for name, col in metadata_columns.items()
+    ]
 
     @dlt.resource(
         name=table.name,
@@ -56,7 +60,7 @@ def load(table: Table, files: list, destination_url: str, dataset_name: str, loa
         write_disposition={"disposition": "merge", "strategy": "delete-insert"},
         primary_key=list(table.merge.keys) if upsert else None,
         merge_key=None if upsert else "_business_date",
-        columns=columns,
+        columns=metadata_columns,
         schema_contract=CONTRACT,
     )
     def rows() -> Iterator[pa.Table | list[dict]]:
@@ -66,10 +70,10 @@ def load(table: Table, files: list, destination_url: str, dataset_name: str, loa
             for stream in open_streams(Path(f.local_path)):
                 with stream:
                     for batch in table.loader.read(stream, column_types):
-                        yield _with_metadata(batch, meta, columns)
+                        yield with_metadata(batch, meta, metadata_fields)
 
     pipeline = dlt.pipeline(
-        pipeline_name=schema_name(table),
+        pipeline_name=table.schema_name,
         pipelines_dir=tempfile.mkdtemp(prefix="dlt_"),  # state lives in the destination, not on this pod
         destination=dest,
         dataset_name=dataset_name,
@@ -93,15 +97,11 @@ def open_streams(path: Path) -> Iterator[BinaryIO]:
         yield fsspec.open(str(path), "rb", compression=fsspec.utils.infer_compression(name)).open()
 
 
-ARROW_TYPES = {"date": pa.date32(), "bigint": pa.int64(), "text": pa.string()}
-
-
-def _with_metadata(batch: pa.Table | list[dict], meta: dict, columns: dict) -> pa.Table | list[dict]:
+def with_metadata(batch: pa.Table | list[dict], meta: dict, fields: list[pa.Field]) -> pa.Table | list[dict]:
     """Arrow tables get typed columns appended. Dicts stay dicts so dlt can flatten and unnest them."""
     if not isinstance(batch, pa.Table):
         return [row | meta for row in batch]
     n = len(batch)
-    for name, value in meta.items():
-        typ = ARROW_TYPES[columns[name]["data_type"]]
-        batch = batch.append_column(pa.field(name, typ, nullable=columns[name]["nullable"]), pa.array([value] * n, typ))
+    for f in fields:
+        batch = batch.append_column(f, pa.array([meta[f.name]] * n, f.type))
     return batch

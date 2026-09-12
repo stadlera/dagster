@@ -1,14 +1,19 @@
 """Static description of what we ingest.
 
-Feed  = what we download: one provider connection and the remote paths we mirror. Configured upfront.
-Table = what we load: a selection of mirrored files and how they map to one SQL table. Configured
-        once real files have been seen in the manifest.
+Feed    = what we download: one provider connection and the remote paths we mirror. Configured upfront.
+Table   = what we load: a selection of mirrored files and how they map to one SQL table. Configured
+          once real files have been seen in the manifest.
+Dataset = one feed, its tables, its committed schemas and any custom Dagster objects, declared in
+          one package under ingest.datasets.<name>.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
+
+from dagster import Definitions
 
 from ingest.delivery import ExchangeCalendar, Expectation
 from ingest.loaders import CsvLoader, Loader
@@ -32,6 +37,8 @@ class ReplaceDay:
 
 @dataclass(frozen=True)
 class Upsert:
+    """Rows with the same business key are replaced."""
+
     keys: tuple[str, ...]
 
 
@@ -55,6 +62,11 @@ class Table:
         return f"{self.feed}/{self.name}"
 
     @property
+    def schema_name(self) -> str:
+        """Name of the dlt pipeline and of the committed schema file."""
+        return f"{self.feed}_{self.name}"
+
+    @property
     def attribute_names(self) -> tuple[str, ...]:
         """Named groups across all select patterns except `date`; each becomes a _<name> column."""
         names = {g for p in self.select for g in re.compile(p).groupindex if g != "date"}
@@ -68,3 +80,16 @@ class Table:
 
     def with_merge(self, merge: ReplaceDay | Upsert) -> Table:
         return replace(self, merge=merge)
+
+
+@dataclass(frozen=True)
+class Dataset:
+    feed: Feed
+    tables: tuple[Table, ...] = ()
+    schema_dir: Path = Path("schemas")  # <schema_dir>/import is committed, <schema_dir>/export is generated
+    extra: Definitions | None = None  # custom assets, sensors or schedules for this dataset
+
+    def __post_init__(self) -> None:
+        for t in self.tables:
+            if t.feed != self.feed.name:
+                raise ValueError(f"table {t.key} does not belong to feed {self.feed.name}")

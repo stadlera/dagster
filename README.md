@@ -7,17 +7,25 @@ Dagster ingestion of external finance datasets.
 
 ## Layout
 
-    src/ingest/config.py       Feed / Table declarations
-    src/ingest/resources.py    Remote (any fsspec filesystem), Landing, Manifest (SQLAlchemy, one table)
-    src/ingest/sync.py         list remote, diff against manifest, download new/changed files
-    src/ingest/loaders.py      CsvLoader, ParquetLoader, JsonLoader, AvroLoader, FunctionLoader (stream -> arrow)
-    src/ingest/load.py         open landed files (zip/tar members and gz via fsspec), add metadata, dlt merge
-    src/ingest/schema.py       committed schema: profiler proposes a dlt schema YAML, loaders read with its types
-    src/ingest/profile.py      CLI: uv run python -m ingest.profile <feed>/<table>
-    src/ingest/delivery.py     expectations: ExchangeCalendar, Weekdays, NoExpectation
-    src/ingest/factory.py      config -> assets, delivery checks, sync schedule, load sensor
-    src/ingest/definitions.py  Dagster entry point: declare feeds and tables here
-    schemas/import/            dlt schemas, reviewed and committed; schemas/export/ is generated
+    src/ingest/
+      config.py            Feed / Table / Dataset declarations and merge strategies
+      resources.py         Remote (any fsspec filesystem), Landing, Manifest (SQLAlchemy, one table), Sql
+      sync.py              list remote, diff against manifest, download new/changed files
+      loaders.py           CsvLoader, ParquetLoader, JsonLoader, AvroLoader, FunctionLoader (stream -> arrow/dicts)
+      load.py              open landed files (zip/tar members and gz via fsspec), add metadata, dlt merge
+      schema.py            committed schema: profiler proposes a dlt schema YAML, loaders read with its types
+      delivery.py          expectations: ExchangeCalendar, Weekdays, NoExpectation
+      factory.py           Dataset -> assets, delivery checks, sync schedule, load sensor
+      definitions.py       Dagster entry point: shared resources + all discovered datasets
+      profile.py           CLI: uv run python -m ingest.profile <feed>/<table>
+      datasets/
+        tradeweb/
+          __init__.py      feed, tables, optional custom Dagster objects  -> `dataset = Dataset(...)`
+          schemas/import/  committed dlt schemas (schemas/export/ is generated and ignored)
+
+Adding a dataset means adding one package under `datasets/` that exposes a module-level
+`dataset`. Custom assets, sensors or schedules for that provider go into `Dataset(extra=Definitions(...))`
+in the same package, next to its schemas.
 
 Landing layout mirrors the remote: `<root>/<feed>/<last path component>/<relative path>[.vN]`.
 A changed remote file is downloaded as a new version; the old manifest row becomes `superseded`.
@@ -44,7 +52,7 @@ Empty partitions materialize with zero rows; missing deliveries are reported by 
 
 1. Run the raw asset so files are landed and classified.
 2. `uv run python -m ingest.profile tradeweb/em` samples recent files and writes
-   `schemas/import/tradeweb_em.schema.yaml`: bigint / decimal(p,s) / date / timestamp are detected
+   `datasets/tradeweb/schemas/import/tradeweb_em.schema.yaml`: bigint / decimal(p,s) / date / timestamp are detected
    from the values, text gets a length bucket (20, 50, 100, 255, 1000, else max).
 3. Review the YAML (e.g. keep identifiers with leading zeros as text), commit it.
 4. Loads read with the committed types: CSV via pyarrow column types, JSON coerced by dlt,

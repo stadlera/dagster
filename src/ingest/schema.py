@@ -1,4 +1,4 @@
-"""Committed schemas: dlt schema YAML in schemas/import/<feed>_<table>.schema.yaml.
+"""Committed schemas: dlt schema YAML in <dataset>/schemas/import/<feed>_<table>.schema.yaml.
 
 `profile` proposes one from landed files (run once, review, commit). `committed_types` turns the
 committed columns into arrow types so loaders read with them instead of inferring per file.
@@ -27,12 +27,8 @@ DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
 
 
-def schema_name(table: Table) -> str:
-    return f"{table.feed}_{table.name}"
-
-
 def schema_path(table: Table, schema_dir: Path) -> Path:
-    return schema_dir / "import" / f"{schema_name(table)}.schema.yaml"
+    return schema_dir / "import" / f"{table.schema_name}.schema.yaml"
 
 
 def committed_types(table: Table, schema_dir: Path, caps: DestinationCapabilitiesContext) -> dict[str, pa.DataType]:
@@ -89,7 +85,11 @@ class ColumnStats:
         if self.kinds <= {"bigint"} and self.kinds:
             return col | {"data_type": "bigint"}
         if self.kinds <= {"bigint", "decimal"} and "decimal" in self.kinds:
-            return col | {"data_type": "decimal", "precision": self.int_digits + self.frac_digits, "scale": self.frac_digits}
+            return col | {
+                "data_type": "decimal",
+                "precision": self.int_digits + self.frac_digits,
+                "scale": self.frac_digits,
+            }
         if self.kinds == {"date"}:
             return col | {"data_type": "date"}
         if self.kinds == {"timestamp"}:
@@ -118,7 +118,7 @@ def profile(table: Table, files: list, max_rows: int = 200_000) -> Schema:
                     rows += len(batch)
                     if rows >= max_rows:
                         break
-    schema = Schema(schema_name(table))
+    schema = Schema(table.schema_name)
     schema.update_table(new_table(table.name, columns=[s.column(name) for name, s in stats.items()]))
     return schema
 

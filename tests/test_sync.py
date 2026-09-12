@@ -6,11 +6,11 @@ from datetime import date
 
 import dlt
 import fastavro
-import pyarrow as pa
-import yaml
 import fsspec
+import pyarrow as pa
 import pytest
 import sqlalchemy as sa
+import yaml
 
 from ingest.config import Feed, Table, Upsert
 from ingest.delivery import Weekdays
@@ -37,11 +37,20 @@ def env(tmp_path):
 
 
 def run_load(tmp_path, manifest, table, day, load_id, end=None):
-    return load(table, manifest.files_for(table.key, day, end), f"sqlite:///{tmp_path}/warehouse.db", "raw", load_id, schema_dir=tmp_path / "schemas")
+    return load(
+        table,
+        manifest.files_for(table.key, day, end),
+        f"sqlite:///{tmp_path}/warehouse.db",
+        "raw",
+        load_id,
+        schema_dir=tmp_path / "schemas",
+    )
 
 
 def query(tmp_path, sql):
-    with sa.create_engine(f"sqlite:///{tmp_path}/warehouse__raw.db").connect() as conn:  # dlt: one sqlite file per dataset
+    with sa.create_engine(
+        f"sqlite:///{tmp_path}/warehouse__raw.db"
+    ).connect() as conn:  # dlt: one sqlite file per dataset
         return conn.execute(sa.text(sql)).all()
 
 
@@ -73,10 +82,15 @@ def test_classify_multiple_selects_named_groups_ignore_and_ambiguity(env):
     (remote / "em-2026-09-08.tmp.csv").write_bytes(b"")
     feed = Feed(name="tradeweb", remote=feed.remote, cron="", paths=feed.paths, maxdepth=2, exclude=feed.exclude)
     sync(fs, feed, landing, manifest)
-    regional = Table("tradeweb", "em", ignore=(r"\.tmp\.csv$",), select=(
-        r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-        r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-    ))
+    regional = Table(
+        "tradeweb",
+        "em",
+        ignore=(r"\.tmp\.csv$",),
+        select=(
+            r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+            r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        ),
+    )
     assert manifest.classify([regional]) == 3
     rows = manifest.files_for(regional.key, date(2026, 9, 8))
     assert sorted((r.attributes or {} for r in rows), key=len) == [{}, {"region": "apac"}]
@@ -100,7 +114,9 @@ def test_revision_is_kept_as_new_version(env):
     manifest.classify([TABLE])
     assert len(result.revisions) == 1 and result.revisions[0].endswith(".v2")
     assert manifest.latest(feed.name)[str(path)].version == 2
-    assert [f.local_path for f in manifest.files_for(TABLE.key, date(2026, 9, 9))] == [str(landing.path(feed.name, "EM/em-2026-09-09.csv", 2))]
+    assert [f.local_path for f in manifest.files_for(TABLE.key, date(2026, 9, 9))] == [
+        str(landing.path(feed.name, "EM/em-2026-09-09.csv", 2))
+    ]
 
 
 def test_load_replaces_business_date_reads_zip_and_gz(env, tmp_path):
@@ -129,10 +145,14 @@ def test_named_groups_become_columns_and_upsert_merges_on_key(env, tmp_path):
     (remote / "apac" / "em-2026-09-08.csv").write_bytes(b"isin,price\nXS1,9.0\nXS7,7.0\n")
     feed = Feed(name="tradeweb", remote=feed.remote, cron="", paths=feed.paths, maxdepth=2, exclude=feed.exclude)
     sync(fs, feed, landing, manifest)
-    table = Table("tradeweb", "em", select=(
-        r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-        r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-    )).with_merge(Upsert(keys=("isin",)))
+    table = Table(
+        "tradeweb",
+        "em",
+        select=(
+            r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+            r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        ),
+    ).with_merge(Upsert(keys=("isin",)))
     manifest.classify([table])
 
     run_load(tmp_path, manifest, table, date(2026, 9, 8), "run-1")
@@ -143,7 +163,11 @@ def test_named_groups_become_columns_and_upsert_merges_on_key(env, tmp_path):
 
 def test_avro_loader(env, tmp_path):
     fs, feed, landing, manifest, remote = env
-    schema = {"type": "record", "name": "Row", "fields": [{"name": "isin", "type": "string"}, {"name": "qty", "type": "long"}]}
+    schema = {
+        "type": "record",
+        "name": "Row",
+        "fields": [{"name": "isin", "type": "string"}, {"name": "qty", "type": "long"}],
+    }
     with open(remote / "em-2026-09-12.avro", "wb") as f:
         fastavro.writer(f, schema, [{"isin": "XS1", "qty": 5}, {"isin": "XS2", "qty": 6}])
     sync(fs, feed, landing, manifest)
@@ -165,13 +189,17 @@ def test_nested_json_is_flattened_and_unnested_by_dlt(env, tmp_path):
     run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-1")
     run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-2")  # reload must also replace child rows
     assert query(tmp_path, "select isin, issuer__name, _business_date, _load_id from bonds order by isin") == [
-        ("XS1", "ACME", "2026-09-12", "run-2"), ("XS2", "B", "2026-09-12", "run-2")]
+        ("XS1", "ACME", "2026-09-12", "run-2"),
+        ("XS2", "B", "2026-09-12", "run-2"),
+    ]
     assert query(tmp_path, "select amt from bonds__coupons") == [(1.5,), (1.5,)]
 
 
 def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_path):
     fs, feed, landing, manifest, remote = env
-    (remote / "em-2026-09-08.csv").write_bytes(b"id,isin,price,as_of,note\n00123,XS1,1.50,2026-09-08,hello\n7,XS2,12.345,2026-09-08,\n")
+    (remote / "em-2026-09-08.csv").write_bytes(
+        b"id,isin,price,as_of,note\n00123,XS1,1.50,2026-09-08,hello\n7,XS2,12.345,2026-09-08,\n"
+    )
     sync(fs, feed, landing, manifest)
     manifest.classify([TABLE])
     schema_dir = tmp_path / "schemas"
@@ -180,11 +208,18 @@ def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_pa
     cols = yaml.safe_load(path.read_text())["tables"]["em"]["columns"]
     assert cols["id"] == {"nullable": True, "data_type": "bigint"}
     assert cols["price"] == {"nullable": True, "data_type": "decimal", "precision": 5, "scale": 3}
-    assert cols["as_of"]["data_type"] == "date" and cols["note"] == {"nullable": True, "data_type": "text", "precision": 20}
+    assert cols["as_of"]["data_type"] == "date" and cols["note"] == {
+        "nullable": True,
+        "data_type": "text",
+        "precision": 20,
+    }
 
     # review step: the id has leading zeros, keep it as text
     path.write_text(path.read_text().replace("data_type: bigint", "data_type: text\n        precision: 20"))
-    assert committed_types(TABLE, schema_dir, dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities())["id"] == pa.string()
+    assert (
+        committed_types(TABLE, schema_dir, dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities())["id"]
+        == pa.string()
+    )
 
     run_load(tmp_path, manifest, TABLE, date(2026, 9, 8), "run-1")
     assert query(tmp_path, "select id, price from em order by id") == [("00123", 1.5), ("7", 12.345)]
@@ -196,11 +231,18 @@ def test_monthly_window_loads_all_days(env, tmp_path):
     monthly = Table("tradeweb", "em_monthly", select=TABLE.select, partition="monthly")
     manifest.classify([monthly])
     assert run_load(tmp_path, manifest, monthly, date(2026, 9, 1), "run-1", end=date(2026, 10, 1))["rows"] == 2
-    assert query(tmp_path, "select distinct _business_date from em_monthly order by 1") == [("2026-09-08",), ("2026-09-09",)]
+    assert query(tmp_path, "select distinct _business_date from em_monthly order by 1") == [
+        ("2026-09-08",),
+        ("2026-09-09",),
+    ]
 
 
 def test_missing_days_respects_calendar_and_lag():
     expectation = Weekdays(lag_days=1, holidays=(date(2026, 9, 7),))
     counts = {date(2026, 9, 8): 1, date(2026, 9, 10): 1}
     # Friday 11th: due through the 10th; 7th holiday, 5th/6th weekend
-    assert expectation.missing_days(counts, today=date(2026, 9, 11)) == [date(2026, 9, 3), date(2026, 9, 4), date(2026, 9, 9)]
+    assert expectation.missing_days(counts, today=date(2026, 9, 11)) == [
+        date(2026, 9, 3),
+        date(2026, 9, 4),
+        date(2026, 9, 9),
+    ]

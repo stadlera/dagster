@@ -23,15 +23,14 @@ class NoExpectation:
         return []
 
 
-@dataclass(frozen=True)
-class Weekdays:
-    lag_days: int = 1
-    files_per_day: int = 1
-    holidays: tuple[date, ...] = ()
+class CalendarExpectation:
+    """Shared logic: business days in the look-back window with fewer files than expected."""
+
+    lag_days: int
+    files_per_day: int
 
     def expected_days(self, start: date, end: date) -> list[date]:
-        days = [start + timedelta(i) for i in range((end - start).days + 1)]
-        return [d for d in days if d.weekday() < 5 and d not in self.holidays]
+        raise NotImplementedError
 
     def missing_days(self, counts: dict[date, int], today: date) -> list[date]:
         last_due = today - timedelta(days=self.lag_days)
@@ -40,7 +39,18 @@ class Weekdays:
 
 
 @dataclass(frozen=True)
-class ExchangeCalendar:
+class Weekdays(CalendarExpectation):
+    lag_days: int = 1
+    files_per_day: int = 1
+    holidays: tuple[date, ...] = ()
+
+    def expected_days(self, start, end):
+        days = [start + timedelta(i) for i in range((end - start).days + 1)]
+        return [d for d in days if d.weekday() < 5 and d not in self.holidays]
+
+
+@dataclass(frozen=True)
+class ExchangeCalendar(CalendarExpectation):
     """Trading sessions of an exchange_calendars calendar, e.g. XLON, XNYS, XFRA."""
 
     name: str = "XLON"
@@ -48,10 +58,8 @@ class ExchangeCalendar:
     files_per_day: int = 1
     holidays: tuple[date, ...] = ()
 
-    def expected_days(self, start: date, end: date) -> list[date]:
+    def expected_days(self, start, end):
         import exchange_calendars as xc
 
         sessions = xc.get_calendar(self.name).sessions_in_range(str(start), str(end))
         return [d.date() for d in sessions if d.date() not in self.holidays]
-
-    missing_days = Weekdays.missing_days

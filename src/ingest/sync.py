@@ -38,7 +38,9 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
             if feed.exclude and re.search(feed.exclude, posixpath.basename(remote_path)):
                 result.ignored += 1
                 if prev is None:
-                    manifest.record(feed=feed.name, remote_path=remote_path, remote_mtime=mtime, size=size, status="ignored")
+                    manifest.record(
+                        feed=feed.name, remote_path=remote_path, remote_mtime=mtime, size=size, status="ignored"
+                    )
                 continue
 
             if prev is not None and prev.remote_mtime == mtime and prev.size == size:
