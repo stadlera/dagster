@@ -23,8 +23,8 @@ One table goes through five stages; each stage is configured by one object on th
       factory.py           Dataset -> assets, checks, sync schedule, load sensor
       definitions.py       Dagster entry point: shared resources + all discovered datasets
       profile.py           CLI: uv run python -m ingest.profile <feed>/<table>
-      alerting.py          Notifier resource, run-failure and check-failure sensors
-      ops.py               operator helpers: show / reload / ignore / reclassify (also a CLI)
+      alerting.py          Notifier resource, run-failure and run-findings (checks, schema changes) sensors
+      ops.py               operator helpers: reload / ignore / reclassify (also a CLI)
       datasets/<name>/     `dataset = Dataset(...)`, custom Dagster objects, schemas/import/<feed>.schema.yaml
 
 Dagster objects per dataset: one unpartitioned `raw/<feed>` asset (mirror + classify), one partitioned
@@ -49,13 +49,13 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
                    remote=Remote(protocol="sftp", options={"host": "sftp.acme.com", "port": "22",
                                  "username": "us", "password": EnvVar("ACME_PASSWORD")}))
                    # or key_filename=... ; options are passed to paramiko's SSHClient.connect
-
-   A subset is a remote folder holding distinct data (a sub dataset, a region, ...). Files are keyed
-   as `<subset>/<path below the subset root>` everywhere: in the manifest (`subset`, `path`), in the
-   landing area and in the select patterns. Two subsets never collide, whatever their file names.
        dataset = Dataset(feed, tables=(), schema_dir=Path(__file__).parent / "schemas")
 
-   Start with no tables: the sync runs, the manifest fills, and you can look at what actually arrives.
+   A subset is one remote folder holding distinct data (a sub dataset, a region, ...). Files are keyed
+   as `<subset>/<path below the subset root>` everywhere: in the manifest (`subset`, `path`), in the
+   landing area and in the select patterns. Two subsets never collide, whatever their file names; a
+   table may draw from several subsets. Start with no tables: the sync runs, the manifest fills, and
+   you can look at what actually arrives.
 2. Declare tables once the naming is known. A table names its feed, its SQL table and its source; every
    other stage has a default (daily partitions, CSV, dlt replace-by-day, XLON calendar with one day lag
    and at least one file per day) and is swapped with a builder method:
@@ -90,14 +90,61 @@ run id) and `_<name>` for each named group of the select pattern. Nested JSON is
 `parent__child` columns and lists into `<table>__<field>` child tables; `DltWriter(max_nesting=N)`
 limits the depth, 0 keeps nested values as json text.
 
+## Semantics worth knowing
+
+- **Business date** is a property of the file, taken from its name by the select pattern (`date` group +
+  `date_format`). For period files it is the period start (`%Y%m` -> first of month, `%Y` -> Jan 1st).
+  It is the partition key of the SQL asset and the `_business_date` of every row, never the delivery day.
+- **Delivery expectation** = calendar of business dates + lag + file count. The calendar says which
+  business dates exist, `lag_days` how long after a business date its files may take. A monthly file
+  arriving mid next month is `Delivery(Monthly(day=1), lag_days=15)`. Only the last `occurrences` dates
+  are checked (default 5), so a check never depends on how far back history goes.
+- **Reruns are safe everywhere.** Sync downloads only what is new or changed. Classification only
+  touches unassigned rows. A load replaces the business dates it contains (or the keys, with `Upsert`).
+  Materializing a partition again is a reload; the load sensor only asks for partitions with unloaded
+  files and keys its run requests by the newest pending file, so a revision triggers exactly one reload.
+- **Two notions of "same file".** A *version* is the same remote path with changed content (mtime or
+  size differ): the old row becomes `superseded`, v2 lands next to v1. An *identity* is the logical file
+  across paths (see below): moved or repacked copies dedupe by content, restatements supersede.
+- **Ambiguity is an error.** A file matching the select patterns of two tables fails the raw asset run
+  (after committing everything unambiguous) so a config mistake cannot load data twice.
+- **Schema contract**: new columns are accepted and reported, type changes are refused, the load fails
+  and nothing is written. Widening is a manual YAML edit. Without a committed schema dlt infers per load.
+
+## Provider patterns
+
+| Provider behaviour | Declaration |
+|---|---|
+| Daily file per business day | `Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",))` and the defaults |
+| Several sub datasets / folders | one `Feed.subsets` entry per folder, one table per data kind, `Table(subsets=(...))` |
+| Regions as sibling folders, same schema | subsets per region or one subset with `(?P<region>...)` in the path; `_region` / `_subset` columns |
+| Static "latest" copy next to dated files | `Feed(exclude=r"^latest\.csv$")` (never downloaded, recorded once as `ignored`) |
+| Several files per day (parts, regions) | give them a named group; identical names on one day need one |
+| Daily zip bundling a day's entities | nothing: the zip is one logical file and is read member by member |
+| Yearly / monthly repack of daily files | `Patterns(archives=(r"^EM/em-\d{4}\.zip$",))`: members classified individually, identical ones dedupe |
+| Files moved to an archive folder inside the subset | nothing: same identity, same content -> `duplicate` |
+| Files moved from a shared folder into per-dataset folders | subsets for both, `Patterns(identity=across_subsets)` |
+| Restatement under the same name | nothing: new version, `latest` wins, partition reloads |
+| Restatement under a new name (`_corrected`) | `Patterns(identity=lambda m, p: m.group("date"))` |
+| Provider repacks noisily, corrections impossible | `Patterns(on_collision="first")` |
+| Monthly / weekly / yearly period files | `date_format="%Y%m"` etc., `with_partitioning(Monthly())`, `Delivery(Monthly(day=1), lag_days=N)` |
+| Odd schedules (15th, every Saturday, 1st and 3rd Saturday) | `Delivery(Monthly(day=15))`, `Delivery(Weekly(5))`, `Delivery(NthWeekday((1, 3), 5))` |
+| Full snapshot deliveries on a schedule | business date = snapshot date, daily partitions with gaps, `with_expectation(None)` or the schedule's calendar |
+| CSV with preamble, odd delimiter, no header | `CsvReader(skip_rows=2, delimiter=";", column_names=(...))` |
+| Nested JSON | `JsonReader()`; dlt flattens and unnests, `DltWriter(max_nesting=0)` keeps json text |
+| XML or other formats | `FunctionReader(fn)` yielding dicts or arrow tables |
+| Business key instead of replace-by-day | `DltWriter(merge=Upsert(keys=(...)))` |
+| Date only inside the file content | a custom `Source` (`classify(path)` may open the landed file) |
+
 ## Operating it
 
 - **Manifest** (`files` table) is the ground truth. Statuses: `downloaded` (active), `superseded`
   (newer version of the same remote path or logical identity), `duplicate` (same identity and content
   as an active row), `expanded` (archive whose members are tracked as rows), `ignored` (excluded by the
   feed). `loaded_at` / `load_id` say which run loaded a row.
-- **Landing layout** mirrors the remote: `<root>/<feed>/<last path component>/<relative path>[.vN]`.
-  A changed remote file is downloaded as a new version; nothing is ever modified or extracted.
+- **Landing layout** mirrors the remote: `<root>/<feed>/<subset>/<path below the subset root>[.vN]`.
+  A changed remote file is downloaded as a new version next to the old one; nothing is ever modified,
+  deleted or extracted. The manifest never forgets a file either: rows change status, never disappear.
 - **Delivery checks** run after every sync on the raw asset, one per table. The newest due occurrence
   missing is a warning (may be late), anything else an error.
 - **Alerting**: two sensors send email through the `Notifier` resource: `alert_run_failures`, and
