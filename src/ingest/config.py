@@ -1,10 +1,13 @@
 """Static description of what we ingest.
 
-Feed    = what we download: one provider connection and the remote paths we mirror. Configured upfront.
-Table   = what we load: a selection of mirrored files and how they map to one SQL table. Configured
-          once real files have been seen in the manifest.
-Dataset = one feed, its tables, its committed schema and any custom Dagster objects, declared in
-          one package under ingest.datasets.<name>.
+Feed    = stage 1, mirroring: one provider connection and the remote paths we copy. Configured upfront.
+Table   = one SQL table, composed of one object per stage:
+            source        stage 2  which mirrored files, business date, identity, archives, collisions
+            checks        stage 3  delivery expectation and any other Check
+            partitioning  stage 4  partition granularity and range runs
+            reader/writer stage 5  file format in, sink out
+Dataset = one feed, its tables, its committed schema and any custom Dagster objects, declared in one
+          package under ingest.datasets.<name>.
 
 Asset keys and job names produced by the factory are exposed here (Feed.raw_key, Table.asset_key,
 Dataset.sync_schedule_name, Dataset.load_sensor_name) so custom definitions can wire into them.
@@ -12,16 +15,17 @@ Dataset.sync_schedule_name, Dataset.load_sensor_name) so custom definitions can 
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Literal
 
 from dagster import AssetKey, Definitions
 
 from ingest.checks import Check, Delivery
-from ingest.loaders import CsvLoader, Loader
+from ingest.partitioning import Daily, Partitioning
+from ingest.readers import CsvReader, Reader
 from ingest.resources import Remote
+from ingest.sources import Source
+from ingest.writers import DltWriter, Writer
 
 
 @dataclass(frozen=True)
@@ -39,39 +43,14 @@ class Feed:
 
 
 @dataclass(frozen=True)
-class ReplaceDay:
-    """A reload of a business date replaces all rows of that date."""
-
-
-@dataclass(frozen=True)
-class Upsert:
-    """Rows with the same business key are replaced."""
-
-    keys: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class Table:
     feed: str
     name: str
-    # regexes on the remote path. The business date is the named group `date` (or group 1).
-    # Other named groups become metadata columns, e.g. (?P<region>emea|apac) -> _region.
-    select: tuple[str, ...]
-    ignore: tuple[str, ...] = ()  # downloaded, but never loaded into this table
-    # archives holding several logical files (e.g. a yearly repack): members are classified individually
-    # by the select patterns, so anchor those on the file name, not on the folder
-    archives: tuple[str, ...] = ()
-    # logical identity of a file: default is business date + named groups. Two files with the same
-    # identity are the same file (moved, repacked, restated). Custom: fn(match, remote_path) -> str
-    identity: Callable[[re.Match, str], str] | None = None
-    on_collision: Literal["latest", "first"] = "latest"  # same identity, different content: which one is active
-    date_format: str = "%Y-%m-%d"
-    start_date: str = "2026-01-01"
-    partition: Literal["daily", "weekly", "monthly", "yearly"] = "daily"  # one load covers the partition window
-    max_partitions_per_run: int = 31  # the load sensor groups pending partitions into range runs up to this size
-    loader: Loader = field(default_factory=CsvLoader)
-    merge: ReplaceDay | Upsert = field(default_factory=ReplaceDay)
+    source: Source
     checks: tuple[Check, ...] = (Delivery(),)
+    partitioning: Partitioning = field(default_factory=Daily)
+    reader: Reader = field(default_factory=CsvReader)
+    writer: Writer = field(default_factory=DltWriter)
 
     @property
     def key(self) -> str:
@@ -81,17 +60,17 @@ class Table:
     def asset_key(self) -> AssetKey:
         return AssetKey(["sql", self.feed, self.name])
 
-    @property
-    def attribute_names(self) -> tuple[str, ...]:
-        """Named groups across all select patterns except `date`; each becomes a _<name> column."""
-        names = {g for p in self.select for g in re.compile(p).groupindex if g != "date"}
-        return tuple(sorted(names))
+    def with_source(self, source: Source) -> Table:
+        return replace(self, source=source)
 
-    def with_loader(self, loader: Loader) -> Table:
-        return replace(self, loader=loader)
+    def with_partitioning(self, partitioning: Partitioning) -> Table:
+        return replace(self, partitioning=partitioning)
 
-    def with_merge(self, merge: ReplaceDay | Upsert) -> Table:
-        return replace(self, merge=merge)
+    def with_reader(self, reader: Reader) -> Table:
+        return replace(self, reader=reader)
+
+    def with_writer(self, writer: Writer) -> Table:
+        return replace(self, writer=writer)
 
     def with_expectation(self, delivery: Delivery | None) -> Table:
         """Replace the delivery expectation; None disables it."""

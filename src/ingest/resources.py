@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -102,95 +101,58 @@ class Manifest(ConfigurableResource):
                 )
             conn.execute(sa.insert(files).values(**row))
 
-    def classify(self, tables) -> int:
-        """Assign table, business_date, attributes and identity to downloaded rows matching a table's select
-        patterns. Archives matching a table's `archives` patterns are expanded into member rows first.
-        Rows whose identity already exists become DUPLICATE (same content) or supersede the older row.
-        Raises AmbiguousMatch (after committing the unambiguous ones) if a file matches more than one table.
-        """
-        self._expand_archives(tables)
-        assigned, ambiguous = 0, []
-        with self.engine().begin() as conn:
-            unassigned = conn.execute(
-                sa.select(files.c.id, files.c.feed, files.c.remote_path, files.c.sha256).where(
-                    files.c.status == FileStatus.DOWNLOADED, files.c.table.is_(None)
-                )
-            ).all()
-            for row in unassigned:
-                matches = [(t, m) for t in tables if t.feed == row.feed for m in [_match(t, row.remote_path)] if m]
-                if len(matches) > 1:
-                    ambiguous.append((row.remote_path, [t.key for t, _ in matches]))
-                    continue
-                if not matches:
-                    continue
-                t, m = matches[0]
-                groups = m.groupdict()
-                raw_date = groups.pop("date", None) or m.group(1)
-                day = datetime.strptime(raw_date, t.date_format).date()
-                identity = t.identity(m, row.remote_path) if t.identity else _default_identity(day, groups)
-                identity = f"{t.key}|{identity}"
-                status = self._resolve_collision(conn, t, row, identity)
-                conn.execute(
-                    sa.update(files)
-                    .where(files.c.id == row.id)
-                    .values(table=t.key, business_date=day, attributes=groups, identity=identity, status=status)
-                )
-                assigned += 1
-        if ambiguous:
-            raise AmbiguousMatch(ambiguous)
-        return assigned
+    # --- classification storage (the logic is in classify.py) ---
 
-    def _resolve_collision(self, conn, table, row, identity: str) -> FileStatus:
-        active = conn.execute(
-            sa.select(files.c.id, files.c.sha256).where(
-                files.c.identity == identity, files.c.status == FileStatus.DOWNLOADED, files.c.id != row.id
-            )
-        ).all()
-        if not active:
-            return FileStatus.DOWNLOADED
-        if any(a.sha256 == row.sha256 for a in active):
-            return FileStatus.DUPLICATE
-        if table.on_collision == "first":
-            return FileStatus.SUPERSEDED
-        conn.execute(
-            sa.update(files).where(files.c.id.in_([a.id for a in active])).values(status=FileStatus.SUPERSEDED)
+    def unclassified(self, feed: str, top_level: bool = False) -> list[sa.Row]:
+        stmt = sa.select(files).where(
+            files.c.feed == feed, files.c.status == FileStatus.DOWNLOADED, files.c.table.is_(None)
         )
-        return FileStatus.DOWNLOADED
+        if top_level:
+            stmt = stmt.where(files.c.parent_id.is_(None))
+        with self.engine().connect() as conn:
+            return conn.execute(stmt.order_by(files.c.id)).all()
 
-    def _expand_archives(self, tables) -> None:
-        from ingest.archives import list_members
-
-        patterns = {}
-        for t in tables:
-            patterns.setdefault(t.feed, []).extend(t.archives)
-        if not any(patterns.values()):
-            return
+    def add_members(self, archive: sa.Row, members) -> None:
+        """One row per archive member (remote_path '<archive>!<member>'); the archive becomes EXPANDED."""
         with self.engine().begin() as conn:
-            candidates = conn.execute(
-                sa.select(files).where(
-                    files.c.status == FileStatus.DOWNLOADED, files.c.table.is_(None), files.c.parent_id.is_(None)
-                )
-            ).all()
-            for row in candidates:
-                if not any(re.search(p, row.remote_path) for p in patterns.get(row.feed, [])):
-                    continue
-                for member in list_members(row.local_path):
-                    conn.execute(
-                        sa.insert(files).values(
-                            feed=row.feed,
-                            remote_path=f"{row.remote_path}!{member.name}",
-                            remote_mtime=row.remote_mtime,
-                            size=member.size,
-                            version=row.version,
-                            status=FileStatus.DOWNLOADED,
-                            local_path=row.local_path,
-                            sha256=member.sha256,
-                            downloaded_at=row.downloaded_at,
-                            parent_id=row.id,
-                            member=member.name,
-                        )
+            for m in members:
+                conn.execute(
+                    sa.insert(files).values(
+                        feed=archive.feed,
+                        remote_path=f"{archive.remote_path}!{m.name}",
+                        remote_mtime=archive.remote_mtime,
+                        size=m.size,
+                        version=archive.version,
+                        status=FileStatus.DOWNLOADED,
+                        local_path=archive.local_path,
+                        sha256=m.sha256,
+                        downloaded_at=archive.downloaded_at,
+                        parent_id=archive.id,
+                        member=m.name,
                     )
-                conn.execute(sa.update(files).where(files.c.id == row.id).values(status=FileStatus.EXPANDED))
+                )
+            conn.execute(sa.update(files).where(files.c.id == archive.id).values(status=FileStatus.EXPANDED))
+
+    def assign(self, row_id: int, table: str, day: date, attributes: dict, identity: str, status: FileStatus) -> None:
+        with self.engine().begin() as conn:
+            conn.execute(
+                sa.update(files)
+                .where(files.c.id == row_id)
+                .values(table=table, business_date=day, attributes=attributes, identity=identity, status=status)
+            )
+
+    def active_with_identity(self, identity: str, exclude_id: int) -> list[sa.Row]:
+        stmt = sa.select(files.c.id, files.c.sha256).where(
+            files.c.identity == identity, files.c.status == FileStatus.DOWNLOADED, files.c.id != exclude_id
+        )
+        with self.engine().connect() as conn:
+            return conn.execute(stmt).all()
+
+    def set_status(self, ids: list[int], status: FileStatus) -> None:
+        with self.engine().begin() as conn:
+            conn.execute(sa.update(files).where(files.c.id.in_(ids)).values(status=status))
+
+    # --- loading ---
 
     def files_for(self, table: str, start: date, end: date | None = None) -> list[sa.Row]:
         """Downloaded files with start <= business_date < end (end defaults to the day after start)."""
@@ -230,22 +192,6 @@ class Manifest(ConfigurableResource):
         )
         with self.engine().connect() as conn:
             return dict(conn.execute(stmt).all())
-
-
-def _default_identity(day: date, attributes: dict) -> str:
-    return "|".join([str(day), *(f"{k}={v}" for k, v in sorted(attributes.items()))])
-
-
-def _match(table, remote_path: str) -> re.Match | None:
-    if any(re.search(p, remote_path) for p in table.ignore):
-        return None
-    return next((m for p in table.select if (m := re.search(p, remote_path))), None)
-
-
-class AmbiguousMatch(Exception):
-    def __init__(self, files: list[tuple[str, list[str]]]):
-        super().__init__("files match more than one table: " + "; ".join(f"{p} -> {t}" for p, t in files))
-        self.files = files
 
 
 def utcnow() -> datetime:

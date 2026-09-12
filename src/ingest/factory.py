@@ -4,7 +4,7 @@ Naming is defined in config.py (Feed.raw_key, Table.asset_key, Dataset.sync_sche
 Dataset.load_sensor_name); custom definitions in Dataset.extra can rely on it.
 """
 
-from datetime import date, datetime, time, timezone
+from datetime import date
 
 from dagster import (
     AssetCheckExecutionContext,
@@ -13,16 +13,11 @@ from dagster import (
     AssetExecutionContext,
     AssetSelection,
     BackfillPolicy,
-    DailyPartitionsDefinition,
     Definitions,
     MaterializeResult,
-    MonthlyPartitionsDefinition,
-    PartitionKeyRange,
     RetryPolicy,
     RunRequest,
     ScheduleDefinition,
-    TimeWindowPartitionsDefinition,
-    WeeklyPartitionsDefinition,
     asset,
     asset_check,
     sensor,
@@ -30,47 +25,15 @@ from dagster import (
 from dagster._core.storage.tags import ASSET_PARTITION_RANGE_END_TAG, ASSET_PARTITION_RANGE_START_TAG
 
 from ingest.checks import Check, CheckContext
+from ingest.classify import classify
 from ingest.config import Dataset, Table
 from ingest.load import load
 from ingest.resources import Landing, Manifest, Sql
 from ingest.sync import sync
 
 
-def partitions_def(table: Table) -> TimeWindowPartitionsDefinition:
-    start = table.start_date
-    if table.partition == "yearly":
-        return TimeWindowPartitionsDefinition(start=start, cron_schedule="0 0 1 1 *", fmt="%Y-%m-%d")
-    cls = {
-        "daily": DailyPartitionsDefinition,
-        "weekly": WeeklyPartitionsDefinition,
-        "monthly": MonthlyPartitionsDefinition,
-    }
-    return cls[table.partition](start_date=start)
-
-
-def partition_ranges(
-    pdef: TimeWindowPartitionsDefinition, pending: dict[str, int], max_size: int
-) -> list[tuple[str, str, int]]:
-    """Group pending partition keys (-> newest file id) into contiguous ranges of at most max_size keys.
-    Returns (start_key, end_key, newest_file_id) triples."""
-    if not pending:
-        return []
-    keys = pdef.get_partition_keys_in_range(PartitionKeyRange(min(pending), max(pending)))
-    ranges, current = [], []
-    for key in keys:
-        if key in pending and len(current) < max_size:
-            current.append(key)
-        else:
-            if current:
-                ranges.append(current)
-            current = [key] if key in pending else []
-    if current:
-        ranges.append(current)
-    return [(r[0], r[-1], max(pending[k] for k in r)) for r in ranges]
-
-
 def build_raw_asset(dataset: Dataset):
-    feed, tables = dataset.feed, dataset.tables
+    feed = dataset.feed
     remote_key = f"remote_{feed.name}"
 
     @asset(
@@ -84,7 +47,7 @@ def build_raw_asset(dataset: Dataset):
         manifest: Manifest = context.resources.manifest
         landing = Landing(root=dataset.landing_root) if dataset.landing_root else context.resources.landing
         result = sync(getattr(context.resources, remote_key).fs(), feed, landing, manifest)
-        classified = manifest.classify(tables)
+        classified = classify(manifest, dataset)
         context.log.info(
             "%s: %d new, %d revisions, %d unchanged, %d ignored, %d classified",
             feed.name,
@@ -128,10 +91,10 @@ def build_table_asset(dataset: Dataset, table: Table):
         key=table.asset_key,
         deps=[dataset.feed.raw_key],
         group_name=dataset.feed.name,
-        partitions_def=partitions_def(table),
+        partitions_def=table.partitioning.definition,
         backfill_policy=BackfillPolicy.single_run(),  # a range of partitions is one load
         required_resource_keys={"manifest", "sql"},
-        description=f"{type(table.loader).__name__} on {', '.join(table.select)}",
+        description=f"{type(table.reader).__name__} via {type(table.writer).__name__}",
         # tables of one dataset share a dlt pipeline; limit this key to 1 in the instance to serialize their loads
         op_tags={"dagster/concurrency_key": f"load_{dataset.name}"},
     )
@@ -143,9 +106,7 @@ def build_table_asset(dataset: Dataset, table: Table):
             return MaterializeResult(metadata={"rows": 0, "files": 0})
         result = load(dataset, table, files, dataset.sql_url or context.resources.sql.url, context.run.run_id)
         manifest.mark_loaded([f.id for f in files], context.run.run_id)
-        return MaterializeResult(
-            metadata={"rows": result["rows"], "files": len(files), "dlt_load_ids": result["load_ids"]}
-        )
+        return MaterializeResult(metadata={"rows": result.rows, "files": len(files), **result.details})
 
     return sql_table
 
@@ -160,13 +121,11 @@ def build_load_sensor(dataset: Dataset):
     )
     def load_sensor(manifest: Manifest):
         for t in tables:
-            pdef = partitions_def(t)
             pending: dict[str, int] = {}  # partition key -> newest pending file id
             for day, newest_file in manifest.pending_days(t.key).items():
-                timestamp = datetime.combine(day, time.min, timezone.utc).timestamp()
-                key = pdef.get_partition_key_for_timestamp(timestamp)
+                key = t.partitioning.key_for(day)
                 pending[key] = max(pending.get(key, 0), newest_file)
-            for start, end, newest_file in partition_ranges(pdef, pending, t.max_partitions_per_run):
+            for start, end, newest_file in t.partitioning.ranges(pending):
                 yield RunRequest(
                     # a later revision yields a new key, so it is reloaded
                     run_key=f"{t.key}/{start}/{end}/{newest_file}",

@@ -15,17 +15,27 @@ import yaml
 from dagster import AssetKey, Definitions, asset, materialize
 from dagster._core.storage.tags import ASSET_PARTITION_RANGE_END_TAG, ASSET_PARTITION_RANGE_START_TAG
 
-from ingest.checks import CheckContext, CheckResult, Delivery, Monthly, NthWeekday, Weekdays, Weekly
-from ingest.config import Dataset, Feed, Table, Upsert
-from ingest.factory import build_definitions, partition_ranges, partitions_def
+from ingest.checks import CheckContext, CheckResult, Delivery, NthWeekday, Weekdays, Weekly
+from ingest.checks import Monthly as MonthlyCalendar
+from ingest.classify import AmbiguousMatch, classify
+from ingest.config import Dataset, Feed, Table
+from ingest.factory import build_definitions
 from ingest.load import load
-from ingest.loaders import AvroLoader, JsonLoader
-from ingest.resources import AmbiguousMatch, FileStatus, Landing, Manifest, Remote, Sql, files
+from ingest.partitioning import Monthly, Partitioning, Yearly
+from ingest.readers import AvroReader, JsonReader
+from ingest.resources import FileStatus, Landing, Manifest, Remote, Sql, files
 from ingest.schema import committed_types, profile, write_schema
+from ingest.sources import Patterns
 from ingest.sync import sync
+from ingest.writers import DltWriter, Upsert
 
-TABLE = Table("tradeweb", "em", select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv(\.zip|\.gz)?$",))
+TABLE = Table("tradeweb", "em", Patterns((r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv(\.zip|\.gz)?$",)))
 FEED = Feed(name="tradeweb", remote=Remote(protocol="file"), cron="0 7 * * *", paths=())
+
+
+def classify_all(manifest, *tables):
+    """classify() works per dataset; the tests build one around the given tables"""
+    return classify(manifest, Dataset(FEED, tables))
 
 
 @pytest.fixture
@@ -47,7 +57,10 @@ def make_dataset(tmp_path, feed, *tables):
 
 def run_load(tmp_path, manifest, table, day, load_id, end=None):
     dataset = make_dataset(tmp_path, FEED, table)
-    return load(dataset, table, manifest.files_for(table.key, day, end), f"sqlite:///{tmp_path}/warehouse.db", load_id)
+    result = load(
+        dataset, table, manifest.files_for(table.key, day, end), f"sqlite:///{tmp_path}/warehouse.db", load_id
+    )
+    return {"rows": result.rows, **result.details}
 
 
 def query(tmp_path, sql):
@@ -72,8 +85,8 @@ def test_classify_assigns_table_and_business_date_after_the_fact(env):
     fs, feed, landing, manifest, remote = env
     sync(fs, feed, landing, manifest)
     assert manifest.file_counts(TABLE.key, date(2026, 1, 1)) == {}
-    assert manifest.classify([TABLE]) == 2
-    assert manifest.classify([TABLE]) == 0
+    assert classify_all(manifest, TABLE) == 2
+    assert classify_all(manifest, TABLE) == 0
     assert list(manifest.pending_days(TABLE.key)) == [date(2026, 9, 8), date(2026, 9, 9)]
 
 
@@ -87,22 +100,24 @@ def test_classify_multiple_selects_named_groups_ignore_and_ambiguity(env):
     regional = Table(
         "tradeweb",
         "em",
-        ignore=(r"\.tmp\.csv$",),
-        select=(
-            r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-            r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        Patterns(
+            ignore=(r"\.tmp\.csv$",),
+            select=(
+                r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+                r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+            ),
         ),
     )
-    assert manifest.classify([regional]) == 3
+    assert classify_all(manifest, regional) == 3
     rows = manifest.files_for(regional.key, date(2026, 9, 8))
     assert sorted((r.attributes or {} for r in rows), key=len) == [{}, {"region": "apac"}]
     assert list(manifest.pending_days(regional.key)) == [date(2026, 9, 8), date(2026, 9, 9)]
 
-    other = Table("tradeweb", "em_copy", select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",))
+    other = Table("tradeweb", "em_copy", Patterns((r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",)))
     (remote / "em-2026-09-10.csv").write_bytes(b"isin,price\n")
     sync(fs, feed, landing, manifest)
     with pytest.raises(AmbiguousMatch, match="em-2026-09-10.csv"):
-        manifest.classify([regional, other])
+        classify_all(manifest, regional, other)
 
 
 def test_revision_is_kept_as_new_version(env):
@@ -113,7 +128,7 @@ def test_revision_is_kept_as_new_version(env):
     os.utime(path, (time.time() + 10, time.time() + 10))
 
     result = sync(fs, feed, landing, manifest)
-    manifest.classify([TABLE])
+    classify_all(manifest, TABLE)
     assert len(result.revisions) == 1 and result.revisions[0].endswith(".v2")
     assert manifest.latest(feed.name)[str(path)].version == 2
     assert [f.local_path for f in manifest.files_for(TABLE.key, date(2026, 9, 9))] == [
@@ -128,7 +143,7 @@ def test_load_replaces_business_date_reads_zip_and_gz(env, tmp_path):
         z.writestr("part2.csv", "isin,price\nXS4,5.0\n")
     (remote / "em-2026-09-11.csv.gz").write_bytes(gzip.compress(b"isin,price\nXS5,6.0\n"))
     sync(fs, feed, landing, manifest)
-    manifest.classify([TABLE])
+    classify_all(manifest, TABLE)
 
     assert run_load(tmp_path, manifest, TABLE, date(2026, 9, 10), "run-1")["rows"] == 3
     run_load(tmp_path, manifest, TABLE, date(2026, 9, 10), "run-2")  # same day again: no duplicates
@@ -150,12 +165,14 @@ def test_named_groups_become_columns_and_upsert_merges_on_key(env, tmp_path):
     table = Table(
         "tradeweb",
         "em",
-        select=(
-            r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
-            r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+        Patterns(
+            (
+                r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+                r"/EM/(?P<region>apac|emea)/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",
+            )
         ),
-    ).with_merge(Upsert(keys=("isin",)))
-    manifest.classify([table])
+    ).with_writer(DltWriter(merge=Upsert(keys=("isin",))))
+    classify_all(manifest, table)
 
     run_load(tmp_path, manifest, table, date(2026, 9, 8), "run-1")
     rows = query(tmp_path, "select isin, price, _region from em order by isin")
@@ -173,8 +190,10 @@ def test_avro_loader(env, tmp_path):
     with open(remote / "em-2026-09-12.avro", "wb") as f:
         fastavro.writer(f, schema, [{"isin": "XS1", "qty": 5}, {"isin": "XS2", "qty": 6}])
     sync(fs, feed, landing, manifest)
-    table = Table("tradeweb", "em_avro", select=(r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.avro$",)).with_loader(AvroLoader())
-    manifest.classify([table])
+    table = Table("tradeweb", "em_avro", Patterns((r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.avro$",))).with_reader(
+        AvroReader()
+    )
+    classify_all(manifest, table)
     assert run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-1")["rows"] == 2
     assert query(tmp_path, "select isin, qty from em_avro order by isin") == [("XS1", 5), ("XS2", 6)]
 
@@ -186,8 +205,8 @@ def test_nested_json_is_flattened_and_unnested_by_dlt(env, tmp_path):
         b'{"isin":"XS2","issuer":{"name":"B","country":"FR"},"coupons":[]}\n'
     )
     sync(fs, feed, landing, manifest)
-    table = Table("tradeweb", "bonds", select=(r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.json$",)).with_loader(JsonLoader())
-    manifest.classify([table])
+    table = Table("tradeweb", "bonds", Patterns((r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.json$",))).with_reader(JsonReader())
+    classify_all(manifest, table)
     run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-1")
     run_load(tmp_path, manifest, table, date(2026, 9, 12), "run-2")  # reload must also replace child rows
     assert query(tmp_path, "select isin, issuer__name, _business_date, _load_id from bonds order by isin") == [
@@ -196,6 +215,14 @@ def test_nested_json_is_flattened_and_unnested_by_dlt(env, tmp_path):
     ]
     assert query(tmp_path, "select amt from bonds__coupons") == [(1.5,), (1.5,)]
 
+    flat = Table("tradeweb", "bonds_flat", table.source).with_reader(JsonReader()).with_writer(DltWriter(max_nesting=0))
+    classify_all(manifest, flat)  # already classified rows belong to `bonds`; re-point the fixture's file
+    with manifest.engine().begin() as conn:
+        conn.execute(sa.update(files).where(files.c.table == table.key).values(table=flat.key))
+    run_load(tmp_path, manifest, flat, date(2026, 9, 12), "run-3")
+    rows = query(tmp_path, "select isin, issuer, coupons from bonds_flat order by isin")
+    assert rows[0][0] == "XS1" and '"ACME"' in rows[0][1] and rows[0][2].startswith("[")
+
 
 def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_path):
     fs, feed, landing, manifest, remote = env
@@ -203,7 +230,7 @@ def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_pa
         b"id,isin,price,as_of,note\n00123,XS1,1.50,2026-09-08,hello\n7,XS2,12.345,2026-09-08,\n"
     )
     sync(fs, feed, landing, manifest)
-    manifest.classify([TABLE])
+    classify_all(manifest, TABLE)
 
     dataset = make_dataset(tmp_path, FEED, TABLE)
     path = write_schema(profile(dataset, TABLE, manifest.files_for(TABLE.key, date(2026, 9, 8))), dataset)
@@ -229,8 +256,8 @@ def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_pa
 def test_monthly_window_loads_all_days(env, tmp_path):
     fs, feed, landing, manifest, remote = env
     sync(fs, feed, landing, manifest)
-    monthly = Table("tradeweb", "em_monthly", select=TABLE.select, partition="monthly")
-    manifest.classify([monthly])
+    monthly = Table("tradeweb", "em_monthly", TABLE.source, partitioning=Monthly())
+    classify_all(manifest, monthly)
     assert run_load(tmp_path, manifest, monthly, date(2026, 9, 1), "run-1", end=date(2026, 10, 1))["rows"] == 2
     assert query(tmp_path, "select distinct _business_date from em_monthly order by 1") == [
         ("2026-09-08",),
@@ -314,8 +341,11 @@ def test_extra_definitions_wire_into_factory_keys(tmp_path):
 ARCHIVED = Table(
     "tradeweb",
     "em",
-    select=(r"em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",),  # anchored on the file name: also matches zip members
-    archives=(r"/em-\d{4}\.zip$",),
+    Patterns(
+        under=r"/EM$",  # members of /EM/em-2026.zip are matched as /EM/<member>
+        select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",),
+        archives=(r"/em-\d{4}\.zip$",),
+    ),
 )
 
 
@@ -333,7 +363,7 @@ def test_yearly_archive_members_dedupe_against_daily_files_and_fill_gaps(env, tm
         z.writestr("em-2026-09-08.csv", (remote / "em-2026-09-08.csv").read_bytes())  # identical repack
         z.writestr("em-2026-09-09.csv", "isin,price\nXS1,9.9\n")  # restated
     sync(fs, feed, landing, manifest)
-    assert manifest.classify([ARCHIVED]) == 5
+    assert classify_all(manifest, ARCHIVED) == 5
 
     st = statuses(manifest, remote)
     assert st["em-2026.zip"] == FileStatus.EXPANDED
@@ -350,22 +380,32 @@ def test_yearly_archive_members_dedupe_against_daily_files_and_fill_gaps(env, tm
         ("XS1", 1.0, "2026-09-08"),
         ("XS1", 9.9, "2026-09-09"),
     ]
-    assert manifest.classify([ARCHIVED]) == 0  # idempotent: nothing re-expanded or re-assigned
+    assert classify_all(manifest, ARCHIVED) == 0  # idempotent: nothing re-expanded or re-assigned
 
 
 def test_moved_file_with_same_content_is_a_duplicate(env):
     fs, feed, landing, manifest, remote = env
+    by_name = Table("tradeweb", "em", Patterns((r"em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",)))  # any folder
     sync(fs, feed, landing, manifest)
-    manifest.classify([ARCHIVED])
+    classify_all(manifest, by_name)
     (remote / "archive").mkdir()
     (remote / "archive" / "em-2026-09-08.csv").write_bytes((remote / "em-2026-09-08.csv").read_bytes())
     feed = Feed(name="tradeweb", remote=feed.remote, cron=feed.cron, paths=feed.paths, maxdepth=2, exclude=feed.exclude)
     sync(fs, feed, landing, manifest)
-    manifest.classify([ARCHIVED])
-    assert len(manifest.files_for(ARCHIVED.key, date(2026, 9, 8))) == 1
+    classify_all(manifest, by_name)
+    assert len(manifest.files_for(by_name.key, date(2026, 9, 8))) == 1
     with manifest.engine().connect() as conn:
         dup = conn.execute(sa.select(files.c.status).where(files.c.remote_path.like("%archive%"))).scalar()
     assert dup == FileStatus.DUPLICATE
+
+
+def test_default_identity_keeps_differently_named_files_of_one_day(env):
+    fs, feed, landing, manifest, remote = env
+    (remote / "em-2026-09-08_part2.csv").write_bytes(b"isin,price\nXS9,9.0\n")
+    sync(fs, feed, landing, manifest)
+    table = Table("tradeweb", "em", Patterns((r"em-(?P<date>\d{4}-\d{2}-\d{2})(_part2)?\.csv$",)))
+    classify_all(manifest, table)
+    assert len(manifest.files_for(table.key, date(2026, 9, 8))) == 2
 
 
 def test_keep_first_policy_and_custom_identity(env):
@@ -375,11 +415,13 @@ def test_keep_first_policy_and_custom_identity(env):
     table = Table(
         "tradeweb",
         "em",
-        select=(r"em-(?P<date>\d{4}-\d{2}-\d{2})(?P<suffix>_corrected)?\.csv$",),
-        identity=lambda m, path: m.group("date"),  # the suffix is not part of the identity
-        on_collision="first",
+        Patterns(
+            select=(r"em-(?P<date>\d{4}-\d{2}-\d{2})(?P<suffix>_corrected)?\.csv$",),
+            identity=lambda m, path: m.group("date"),  # the suffix is not part of the identity
+            on_collision="first",
+        ),
     )
-    manifest.classify([table])
+    classify_all(manifest, table)
     active = manifest.files_for(table.key, date(2026, 9, 8))
     assert [os.path.basename(f.remote_path) for f in active] == ["em-2026-09-08.csv"]
     assert statuses(manifest, remote)["em-2026-09-08_corrected.csv"] == FileStatus.SUPERSEDED
@@ -389,22 +431,23 @@ def test_keep_first_policy_and_custom_identity(env):
 
 
 def test_partition_ranges_are_contiguous_and_capped():
-    pdef = partitions_def(TABLE)
     pending = {"2026-09-01": 1, "2026-09-02": 5, "2026-09-03": 2, "2026-09-07": 9, "2026-09-08": 3}
-    assert partition_ranges(pdef, pending, 31) == [("2026-09-01", "2026-09-03", 5), ("2026-09-07", "2026-09-08", 9)]
-    assert partition_ranges(pdef, pending, 2) == [
+    daily = TABLE.partitioning
+    assert daily.ranges(pending) == [("2026-09-01", "2026-09-03", 5), ("2026-09-07", "2026-09-08", 9)]
+    assert Partitioning(daily.definition, max_per_run=2).ranges(pending) == [
         ("2026-09-01", "2026-09-02", 5),
         ("2026-09-03", "2026-09-03", 2),
         ("2026-09-07", "2026-09-08", 9),
     ]
-    yearly = partitions_def(Table("tradeweb", "y", select=(), partition="yearly", start_date="2024-01-01"))
-    assert partition_ranges(yearly, {"2024-01-01": 1, "2025-01-01": 2}, 31) == [("2024-01-01", "2025-01-01", 2)]
+    yearly = Yearly(start="2024-01-01", max_per_run=31)
+    assert yearly.ranges({"2024-01-01": 1, "2025-01-01": 2}) == [("2024-01-01", "2025-01-01", 2)]
+    assert yearly.key_for(date(2025, 6, 1)) == "2025-01-01"
 
 
 def test_range_run_loads_all_partitions_in_one_dlt_load(env, tmp_path):
     fs, feed, landing, manifest, remote = env
     sync(fs, feed, landing, manifest)
-    manifest.classify([TABLE])
+    classify_all(manifest, TABLE)
     dataset = Dataset(replace(feed, cron="0 7 * * *"), (TABLE,), schema_dir=tmp_path / "schemas")
     defs = build_definitions(
         [dataset], Landing(root=str(landing.root)), manifest, Sql(url=f"sqlite:///{tmp_path}/warehouse.db")
@@ -426,9 +469,9 @@ def test_calendars():
     sept = (date(2026, 9, 1), date(2026, 9, 30))
     assert Weekly(weekday=5).days(*sept) == [date(2026, 9, d) for d in (5, 12, 19, 26)]
     assert NthWeekday((1, 3), weekday=5).days(*sept) == [date(2026, 9, 5), date(2026, 9, 19)]
-    assert Monthly(day=15).days(date(2026, 8, 1), date(2026, 10, 1)) == [date(2026, 8, 15), date(2026, 9, 15)]
+    assert MonthlyCalendar(day=15).days(date(2026, 8, 1), date(2026, 10, 1)) == [date(2026, 8, 15), date(2026, 9, 15)]
 
     # monthly files, lag of 15 days: on Sept 10 the August file is due, the September one is not
-    delivery = Delivery(Monthly(day=1), lag_days=15, occurrences=2)
+    delivery = Delivery(MonthlyCalendar(day=1), lag_days=15, occurrences=2)
     result = evaluate(delivery, {date(2026, 7, 1): 1}, today=date(2026, 9, 10))
     assert result.metadata["violations"] == {"2026-08-01": 0} and result.severity == "WARN"

@@ -1,4 +1,4 @@
-"""Loaders turn one binary stream into arrow tables or lists of dicts. Plug your own by implementing `read`.
+"""Stage 5, reading: a Reader turns one binary stream into arrow tables or lists of dicts.
 
 `column_types` are the committed types (arrow) for known columns. CSV reads with them instead of
 inferring per file; typed formats (Parquet, Avro) carry their own schema and ignore them; JSON yields
@@ -21,12 +21,12 @@ import pyarrow.parquet
 ColumnTypes = dict[str, pa.DataType] | str | None
 
 
-class Loader(Protocol):
+class Reader(Protocol):
     def read(self, stream: BinaryIO, column_types: ColumnTypes = None) -> Iterator[pa.Table | list[dict]]: ...
 
 
 @dataclass(frozen=True)
-class CsvLoader:
+class CsvReader:
     delimiter: str = ","
     encoding: str = "utf-8"
     skip_rows: int = 0  # preamble lines before the header
@@ -55,7 +55,7 @@ class CsvLoader:
 
 
 @dataclass(frozen=True)
-class ParquetLoader:
+class ParquetReader:
     batch_size: int = 1 << 16
 
     def read(self, stream, column_types=None):
@@ -64,7 +64,7 @@ class ParquetLoader:
 
 
 @dataclass(frozen=True)
-class JsonLoader:
+class JsonReader:
     """JSON lines, or a single top-level array. Yields dicts: dlt flattens objects and unnests lists."""
 
     def read(self, stream, column_types=None):
@@ -76,7 +76,7 @@ class JsonLoader:
 
 
 @dataclass(frozen=True)
-class AvroLoader:
+class AvroReader:
     batch_size: int = 1 << 16
 
     def read(self, stream, column_types=None):
@@ -93,7 +93,7 @@ class AvroLoader:
 
 
 @dataclass(frozen=True)
-class FunctionLoader:
+class FunctionReader:
     """Wrap any function(stream) -> iterator of arrow tables or lists of dicts, e.g. an XML parser."""
 
     fn: Callable[[BinaryIO], Iterator[pa.Table | list[dict]]]

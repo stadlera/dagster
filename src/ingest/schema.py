@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -18,7 +19,8 @@ from dlt.common.libs.pyarrow import get_py_arrow_datatype, py_arrow_to_table_sch
 from dlt.common.schema import Schema
 from dlt.common.schema.utils import new_table
 
-from ingest.config import Dataset, Table
+if TYPE_CHECKING:
+    from ingest.config import Dataset, Table
 
 TEXT_BUCKETS = (20, 50, 100, 255, 1000)
 INT = re.compile(r"^-?\d{1,18}$")
@@ -104,7 +106,7 @@ class ColumnStats:
 
 
 def profile(dataset: Dataset, table: Table, files: list, max_rows: int = 200_000) -> Schema:
-    """Read up to max_rows per file through the table's loader (all text for CSV) and propose the table's
+    """Read up to max_rows per file through the table's reader (all text for CSV) and propose the table's
     columns. Returns the dataset schema with this table replaced; other tables are kept."""
     from ingest.archives import open_streams
 
@@ -113,7 +115,7 @@ def profile(dataset: Dataset, table: Table, files: list, max_rows: int = 200_000
         rows = 0
         for stream in open_streams(Path(f.local_path), f.member):
             with stream:
-                for batch in table.loader.read(stream, column_types="string"):
+                for batch in table.reader.read(stream, column_types="string"):
                     if not isinstance(batch, pa.Table):
                         batch = pa.Table.from_pylist(batch)
                     for name in batch.column_names:

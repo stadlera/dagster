@@ -6,7 +6,9 @@ from dagster import EnvVar
 
 from ingest.checks import ExchangeCalendar
 from ingest.config import Dataset, Feed, Table
+from ingest.partitioning import Daily
 from ingest.resources import Remote
+from ingest.sources import Patterns
 
 REMOTE_ROOT = EnvVar("TRADEWEB_REMOTE_ROOT").get_value("examples/remote/tradeweb")
 
@@ -21,9 +23,9 @@ feed = Feed(
 )
 
 tables = (
-    Table(
-        "tradeweb", "em", select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",), start_date="2026-09-01"
-    ).with_expectation(ExchangeCalendar("XLON", lag_days=1).with_files(exactly=1)),
+    Table("tradeweb", "em", Patterns(under=r"/EM$", select=(r"/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",)))
+    .with_partitioning(Daily(start="2026-09-01"))
+    .with_expectation(ExchangeCalendar("XLON", lag_days=1).with_files(exactly=1)),
 )
 
 dataset = Dataset(feed, tables, schema_dir=Path(__file__).parent / "schemas")
