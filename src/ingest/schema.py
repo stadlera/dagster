@@ -1,4 +1,4 @@
-"""Committed schemas: dlt schema YAML in <dataset>/schemas/import/<feed>_<table>.schema.yaml.
+"""Committed schemas: one dlt schema YAML per dataset in <dataset>/schemas/import/<feed>.schema.yaml.
 
 `profile` proposes one from landed files (run once, review, commit). `committed_types` turns the
 committed columns into arrow types so loaders read with them instead of inferring per file.
@@ -18,7 +18,7 @@ from dlt.common.libs.pyarrow import get_py_arrow_datatype, py_arrow_to_table_sch
 from dlt.common.schema import Schema
 from dlt.common.schema.utils import new_table
 
-from ingest.config import Table
+from ingest.config import Dataset, Table
 
 TEXT_BUCKETS = (20, 50, 100, 255, 1000)
 INT = re.compile(r"^-?\d{1,18}$")
@@ -27,16 +27,21 @@ DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
 
 
-def schema_path(table: Table, schema_dir: Path) -> Path:
-    return schema_dir / "import" / f"{table.schema_name}.schema.yaml"
+def schema_path(dataset: Dataset) -> Path:
+    return dataset.schema_dir / "import" / f"{dataset.schema_name}.schema.yaml"
 
 
-def committed_types(table: Table, schema_dir: Path, caps: DestinationCapabilitiesContext) -> dict[str, pa.DataType]:
+def committed_schema(dataset: Dataset) -> Schema | None:
+    path = schema_path(dataset)
+    return Schema.from_dict(yaml.safe_load(path.read_text())) if path.exists() else None
+
+
+def committed_types(dataset: Dataset, table: Table, caps: DestinationCapabilitiesContext) -> dict[str, pa.DataType]:
     """Arrow types of the committed columns, as dlt would map them for the target destination."""
-    path = schema_path(table, schema_dir)
-    if not path.exists():
+    schema = committed_schema(dataset)
+    if schema is None or table.name not in schema.tables:
         return {}
-    columns = yaml.safe_load(path.read_text())["tables"].get(table.name, {}).get("columns", {})
+    columns = schema.tables[table.name].get("columns", {})
     return {
         name: get_py_arrow_datatype(col, caps, "UTC")
         for name, col in columns.items()
@@ -98,8 +103,9 @@ class ColumnStats:
         return col | {"data_type": "text"} | ({"precision": precision} if precision else {})
 
 
-def profile(table: Table, files: list, max_rows: int = 200_000) -> Schema:
-    """Read up to max_rows per file through the table's loader (all text for CSV) and propose a schema."""
+def profile(dataset: Dataset, table: Table, files: list, max_rows: int = 200_000) -> Schema:
+    """Read up to max_rows per file through the table's loader (all text for CSV) and propose the table's
+    columns. Returns the dataset schema with this table replaced; other tables are kept."""
     from ingest.load import open_streams
 
     stats: dict[str, ColumnStats] = {}
@@ -118,13 +124,15 @@ def profile(table: Table, files: list, max_rows: int = 200_000) -> Schema:
                     rows += len(batch)
                     if rows >= max_rows:
                         break
-    schema = Schema(table.schema_name)
+    schema = committed_schema(dataset) or Schema(dataset.schema_name)
+    if table.name in schema.tables:
+        schema.drop_tables([table.name])
     schema.update_table(new_table(table.name, columns=[s.column(name) for name, s in stats.items()]))
     return schema
 
 
-def write_schema(schema: Schema, table: Table, schema_dir: Path) -> Path:
-    path = schema_path(table, schema_dir)
+def write_schema(schema: Schema, dataset: Dataset) -> Path:
+    path = schema_path(dataset)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(schema.to_pretty_yaml())
     return path

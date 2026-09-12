@@ -18,7 +18,7 @@ import fsspec
 import pyarrow as pa
 from dlt.common.libs.pyarrow import get_py_arrow_datatype
 
-from ingest.config import Table, Upsert
+from ingest.config import Dataset, Table, Upsert
 from ingest.schema import committed_types
 
 # keep provider column names, only fix characters that are illegal in SQL identifiers
@@ -36,12 +36,12 @@ def destination(url: str):
     return dlt.destinations.sqlalchemy(credentials=url)
 
 
-def load(table: Table, files: list, destination_url: str, dataset_name: str, load_id: str, schema_dir: Path) -> dict:
+def load(dataset: Dataset, table: Table, files: list, destination_url: str, load_id: str) -> dict:
     """files: manifest rows (need .id, .local_path, .business_date, .attributes). Returns dlt load metrics."""
     upsert = isinstance(table.merge, Upsert)
     dest = destination(destination_url)
     caps = dest.capabilities()
-    column_types = committed_types(table, schema_dir, caps)
+    column_types = committed_types(dataset, table, caps)
 
     metadata_columns = {
         "_business_date": {"data_type": "date", "nullable": False},
@@ -73,12 +73,12 @@ def load(table: Table, files: list, destination_url: str, dataset_name: str, loa
                         yield with_metadata(batch, meta, metadata_fields)
 
     pipeline = dlt.pipeline(
-        pipeline_name=table.schema_name,
+        pipeline_name=dataset.schema_name,
         pipelines_dir=tempfile.mkdtemp(prefix="dlt_"),  # state lives in the destination, not on this pod
         destination=dest,
-        dataset_name=dataset_name,
-        import_schema_path=str(schema_dir / "import"),
-        export_schema_path=str(schema_dir / "export"),
+        dataset_name=dataset.schema_name,
+        import_schema_path=str(dataset.schema_dir / "import"),
+        export_schema_path=str(dataset.schema_dir / "export"),
     )
     info = pipeline.run(rows())
     info.raise_on_failed_jobs()

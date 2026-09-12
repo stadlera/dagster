@@ -3,8 +3,11 @@
 Feed    = what we download: one provider connection and the remote paths we mirror. Configured upfront.
 Table   = what we load: a selection of mirrored files and how they map to one SQL table. Configured
           once real files have been seen in the manifest.
-Dataset = one feed, its tables, its committed schemas and any custom Dagster objects, declared in
+Dataset = one feed, its tables, its committed schema and any custom Dagster objects, declared in
           one package under ingest.datasets.<name>.
+
+Asset keys and job names produced by the factory are exposed here (Feed.raw_key, Table.asset_key,
+Dataset.sync_schedule_name, Dataset.load_sensor_name) so custom definitions can wire into them.
 """
 
 from __future__ import annotations
@@ -13,9 +16,9 @@ import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from dagster import Definitions
+from dagster import AssetKey, Definitions
 
-from ingest.delivery import ExchangeCalendar, Expectation
+from ingest.checks import Check, Delivery
 from ingest.loaders import CsvLoader, Loader
 from ingest.resources import Remote
 
@@ -28,6 +31,10 @@ class Feed:
     paths: tuple[str, ...]
     maxdepth: int | None = 1
     exclude: str | None = None  # files matching this are never downloaded
+
+    @property
+    def raw_key(self) -> AssetKey:
+        return AssetKey(["raw", self.name])
 
 
 @dataclass(frozen=True)
@@ -54,17 +61,16 @@ class Table:
     start_date: str = "2026-01-01"
     partition: str = "daily"  # daily | monthly: one load run covers all files with a business date in the window
     loader: Loader = field(default_factory=CsvLoader)
-    expectation: Expectation = field(default_factory=ExchangeCalendar)
     merge: ReplaceDay | Upsert = field(default_factory=ReplaceDay)
+    checks: tuple[Check, ...] = (Delivery(),)
 
     @property
     def key(self) -> str:
         return f"{self.feed}/{self.name}"
 
     @property
-    def schema_name(self) -> str:
-        """Name of the dlt pipeline and of the committed schema file."""
-        return f"{self.feed}_{self.name}"
+    def asset_key(self) -> AssetKey:
+        return AssetKey(["sql", self.feed, self.name])
 
     @property
     def attribute_names(self) -> tuple[str, ...]:
@@ -75,21 +81,46 @@ class Table:
     def with_loader(self, loader: Loader) -> Table:
         return replace(self, loader=loader)
 
-    def with_expectation(self, expectation: Expectation) -> Table:
-        return replace(self, expectation=expectation)
-
     def with_merge(self, merge: ReplaceDay | Upsert) -> Table:
         return replace(self, merge=merge)
+
+    def with_expectation(self, delivery: Delivery | None) -> Table:
+        """Replace the delivery expectation; None disables it."""
+        others = tuple(c for c in self.checks if not isinstance(c, Delivery))
+        return replace(self, checks=others + ((delivery,) if delivery else ()))
+
+    def with_check(self, check: Check) -> Table:
+        if any(c.name == check.name for c in self.checks):
+            raise ValueError(f"{self.key} already has a check named {check.name}")
+        return replace(self, checks=self.checks + (check,))
 
 
 @dataclass(frozen=True)
 class Dataset:
     feed: Feed
     tables: tuple[Table, ...] = ()
-    schema_dir: Path = Path("schemas")  # <schema_dir>/import is committed, <schema_dir>/export is generated
+    schema_dir: Path = Path("schemas")  # <schema_dir>/import/<feed>.schema.yaml is committed, export/ is generated
+    sql_schema: str | None = None  # SQL schema holding all tables of this dataset; defaults to the feed name
     extra: Definitions | None = None  # custom assets, sensors or schedules for this dataset
 
     def __post_init__(self) -> None:
         for t in self.tables:
             if t.feed != self.feed.name:
                 raise ValueError(f"table {t.key} does not belong to feed {self.feed.name}")
+
+    @property
+    def name(self) -> str:
+        return self.feed.name
+
+    @property
+    def schema_name(self) -> str:
+        """Name of the dlt pipeline and of the committed schema; also the default SQL schema."""
+        return self.sql_schema or self.feed.name
+
+    @property
+    def sync_schedule_name(self) -> str:
+        return f"sync_{self.name}"
+
+    @property
+    def load_sensor_name(self) -> str:
+        return f"load_{self.name}"

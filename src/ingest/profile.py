@@ -18,5 +18,5 @@ manifest: Manifest = definitions.defs.resources["manifest"]
 files = manifest.files_for(table.key, date.min, date.max)[-args.files :]
 if not files:
     raise SystemExit(f"no classified files for {table.key}; run the raw asset first")
-path = write_schema(profile(table, files, args.rows), table, dataset.schema_dir)
+path = write_schema(profile(dataset, table, files, args.rows), dataset)
 print(f"sampled {len(files)} files -> {path}\nreview, adjust types, commit.")

@@ -11,16 +11,19 @@ import pyarrow as pa
 import pytest
 import sqlalchemy as sa
 import yaml
+from dagster import AssetKey, Definitions, asset
 
-from ingest.config import Feed, Table, Upsert
-from ingest.delivery import Weekdays
+from ingest.checks import CheckContext, CheckResult, Delivery, Weekdays
+from ingest.config import Dataset, Feed, Table, Upsert
+from ingest.factory import build_definitions
 from ingest.load import load
 from ingest.loaders import AvroLoader, JsonLoader
-from ingest.resources import AmbiguousMatch, Landing, Manifest, Remote
+from ingest.resources import AmbiguousMatch, Landing, Manifest, Remote, Sql
 from ingest.schema import committed_types, profile, write_schema
 from ingest.sync import sync
 
 TABLE = Table("tradeweb", "em", select=(r"/EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.csv(\.zip|\.gz)?$",))
+FEED = Feed(name="tradeweb", remote=Remote(protocol="file"), cron="0 7 * * *", paths=())
 
 
 @pytest.fixture
@@ -36,21 +39,18 @@ def env(tmp_path):
     return fsspec.filesystem("file"), feed, landing, manifest, remote
 
 
+def make_dataset(tmp_path, feed, *tables):
+    return Dataset(feed, tables, schema_dir=tmp_path / "schemas")
+
+
 def run_load(tmp_path, manifest, table, day, load_id, end=None):
-    return load(
-        table,
-        manifest.files_for(table.key, day, end),
-        f"sqlite:///{tmp_path}/warehouse.db",
-        "raw",
-        load_id,
-        schema_dir=tmp_path / "schemas",
-    )
+    dataset = make_dataset(tmp_path, FEED, table)
+    return load(dataset, table, manifest.files_for(table.key, day, end), f"sqlite:///{tmp_path}/warehouse.db", load_id)
 
 
 def query(tmp_path, sql):
-    with sa.create_engine(
-        f"sqlite:///{tmp_path}/warehouse__raw.db"
-    ).connect() as conn:  # dlt: one sqlite file per dataset
+    # dlt's sqlalchemy destination keeps one sqlite file per SQL schema (= dataset name)
+    with sa.create_engine(f"sqlite:///{tmp_path}/warehouse__tradeweb.db").connect() as conn:
         return conn.execute(sa.text(sql)).all()
 
 
@@ -202,9 +202,10 @@ def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_pa
     )
     sync(fs, feed, landing, manifest)
     manifest.classify([TABLE])
-    schema_dir = tmp_path / "schemas"
 
-    path = write_schema(profile(TABLE, manifest.files_for(TABLE.key, date(2026, 9, 8))), TABLE, schema_dir)
+    dataset = make_dataset(tmp_path, FEED, TABLE)
+    path = write_schema(profile(dataset, TABLE, manifest.files_for(TABLE.key, date(2026, 9, 8))), dataset)
+    assert path.name == "tradeweb.schema.yaml"
     cols = yaml.safe_load(path.read_text())["tables"]["em"]["columns"]
     assert cols["id"] == {"nullable": True, "data_type": "bigint"}
     assert cols["price"] == {"nullable": True, "data_type": "decimal", "precision": 5, "scale": 3}
@@ -216,10 +217,8 @@ def test_profile_proposes_schema_and_load_reads_with_committed_types(env, tmp_pa
 
     # review step: the id has leading zeros, keep it as text
     path.write_text(path.read_text().replace("data_type: bigint", "data_type: text\n        precision: 20"))
-    assert (
-        committed_types(TABLE, schema_dir, dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities())["id"]
-        == pa.string()
-    )
+    caps = dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities()
+    assert committed_types(dataset, TABLE, caps)["id"] == pa.string()
 
     run_load(tmp_path, manifest, TABLE, date(2026, 9, 8), "run-1")
     assert query(tmp_path, "select id, price from em order by id") == [("00123", 1.5), ("7", 12.345)]
@@ -237,12 +236,72 @@ def test_monthly_window_loads_all_days(env, tmp_path):
     ]
 
 
-def test_missing_days_respects_calendar_and_lag():
-    expectation = Weekdays(lag_days=1, holidays=(date(2026, 9, 7),))
+class FakeManifest:
+    def __init__(self, counts):
+        self.counts = counts
+
+    def file_counts(self, table, since):
+        return {d: n for d, n in self.counts.items() if d >= since}
+
+
+def evaluate(delivery, counts, today):
+    ctx = CheckContext(FakeManifest(counts), Sql(url="sqlite://"), TABLE, today)
+    return delivery.evaluate(ctx)
+
+
+def test_delivery_respects_calendar_lag_and_file_count():
+    delivery = Delivery(Weekdays(holidays=(date(2026, 9, 7),)), lag_days=1)
     counts = {date(2026, 9, 8): 1, date(2026, 9, 10): 1}
     # Friday 11th: due through the 10th; 7th holiday, 5th/6th weekend
-    assert expectation.missing_days(counts, today=date(2026, 9, 11)) == [
-        date(2026, 9, 3),
-        date(2026, 9, 4),
-        date(2026, 9, 9),
-    ]
+    result = evaluate(delivery, counts, today=date(2026, 9, 11))
+    assert not result.passed and result.severity == "ERROR"
+    assert list(result.metadata["violations"]) == ["2026-09-03", "2026-09-04", "2026-09-09"]
+
+    # only the newest due day missing is a warning
+    result = evaluate(
+        delivery,
+        {d: 1 for d in map(date(2026, 9, 1).__class__, [])} | {date(2026, 9, d): 1 for d in (1, 2, 3, 4, 8, 9)},
+        today=date(2026, 9, 11),
+    )
+    assert not result.passed and result.severity == "WARN"
+
+    # exact file count: two files on one day violate exactly=1
+    exact = delivery.with_files(exactly=1)
+    counts = {date(2026, 9, d): 1 for d in (1, 2, 3, 4, 8, 9, 10)} | {date(2026, 9, 9): 2}
+    result = evaluate(exact, counts, today=date(2026, 9, 11))
+    assert result.metadata["violations"] == {"2026-09-09": 2}
+    assert evaluate(delivery, counts, today=date(2026, 9, 11)).passed
+
+
+class RowCount:
+    name, target = "row_count", "sql"
+
+    def evaluate(self, ctx):
+        return CheckResult(True)
+
+
+def test_table_check_builders():
+    table = TABLE.with_expectation(None)
+    assert table.checks == ()
+
+    table = table.with_check(RowCount())
+    assert [c.name for c in table.checks] == ["row_count"]
+    with pytest.raises(ValueError):
+        table.with_check(RowCount())
+
+
+def test_extra_definitions_wire_into_factory_keys(tmp_path):
+    table = TABLE.with_check(
+        type("RowCount", (), {"name": "row_count", "target": "sql", "evaluate": lambda s, c: CheckResult(True)})()
+    )
+
+    @asset(deps=[table.asset_key])
+    def em_report(): ...
+
+    dataset = Dataset(FEED, (table,), schema_dir=tmp_path, extra=Definitions(assets=[em_report]))
+    defs = build_definitions([dataset], Landing(root="x"), Manifest(url="sqlite://"), Sql(url="sqlite://"))
+    graph = defs.get_repository_def().asset_graph
+    assert FEED.raw_key == AssetKey(["raw", "tradeweb"]) and table.asset_key == AssetKey(["sql", "tradeweb", "em"])
+    assert graph.get(AssetKey("em_report")).parent_keys == {table.asset_key}
+    assert {c.name for c in graph.asset_check_keys} == {"delivery_em", "row_count"}
+    assert defs.get_schedule_def(dataset.sync_schedule_name) and defs.get_sensor_def(dataset.load_sensor_name)

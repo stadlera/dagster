@@ -26,7 +26,6 @@ class Sql(ConfigurableResource):
     """Target database for loaded tables: any sqlalchemy url, mssql+pyodbc://... in production."""
 
     url: str
-    dataset_name: str = "raw"
 
 
 class Landing(ConfigurableResource):

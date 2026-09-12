@@ -1,12 +1,16 @@
-"""Turn Dataset config into Dagster assets, checks, schedules and sensors."""
+"""Turn Dataset config into Dagster assets, checks, schedules and sensors.
 
-from datetime import date, timedelta
+Naming is defined in config.py (Feed.raw_key, Table.asset_key, Dataset.sync_schedule_name,
+Dataset.load_sensor_name); custom definitions in Dataset.extra can rely on it.
+"""
+
+from datetime import date
 
 from dagster import (
+    AssetCheckExecutionContext,
     AssetCheckResult,
     AssetCheckSeverity,
     AssetExecutionContext,
-    AssetKey,
     AssetSelection,
     DailyPartitionsDefinition,
     Definitions,
@@ -20,21 +24,13 @@ from dagster import (
     sensor,
 )
 
-from ingest.config import Dataset, Feed, Table
-from ingest.delivery import LOOKBACK_DAYS
+from ingest.checks import Check, CheckContext
+from ingest.config import Dataset, Table
 from ingest.load import load
 from ingest.resources import Landing, Manifest, Sql
 from ingest.sync import sync
 
 PARTITIONS = {"daily": DailyPartitionsDefinition, "monthly": MonthlyPartitionsDefinition}
-
-
-def raw_key(feed: Feed) -> AssetKey:
-    return AssetKey(["raw", feed.name])
-
-
-def table_key(table: Table) -> AssetKey:
-    return AssetKey(["sql", table.feed, table.name])
 
 
 def partition_key(table: Table, day: date) -> str:
@@ -46,7 +42,7 @@ def build_raw_asset(dataset: Dataset):
     remote_key = f"remote_{feed.name}"
 
     @asset(
-        key=raw_key(feed),
+        key=feed.raw_key,
         group_name=feed.name,
         description=f"Byte-equivalent mirror of {', '.join(feed.paths)}",
         required_resource_keys={remote_key, "landing", "manifest"},
@@ -79,42 +75,39 @@ def build_raw_asset(dataset: Dataset):
     return raw
 
 
-def build_delivery_check(dataset: Dataset, table: Table):
-    @asset_check(
-        asset=raw_key(dataset.feed), name=f"delivery_{table.name}", description="Files arrived per delivery calendar"
-    )
-    def delivery(manifest: Manifest) -> AssetCheckResult:
-        today = date.today()
-        lag = table.expectation.lag_days
-        counts = manifest.file_counts(table.key, today - timedelta(days=LOOKBACK_DAYS + lag))
-        missing = table.expectation.missing_days(counts, today)
-        last_due = today - timedelta(days=lag)
-        # only the newest due day missing: warn, it may just be late. Anything older: error.
-        severity = AssetCheckSeverity.WARN if missing == [last_due] else AssetCheckSeverity.ERROR
+def build_check(dataset: Dataset, table: Table, check: Check):
+    target = dataset.feed.raw_key if check.target == "raw" else table.asset_key
+    name = check.name if check.target == "sql" else f"{check.name}_{table.name}"
+
+    @asset_check(asset=target, name=name, description=f"{type(check).__name__} on {table.key}")
+    def run_check(context: AssetCheckExecutionContext, manifest: Manifest, sql: Sql) -> AssetCheckResult:
+        partition = context.run.tags.get("dagster/partition")
+        result = check.evaluate(CheckContext(manifest, sql, table, date.today(), partition))
         return AssetCheckResult(
-            passed=not missing, severity=severity, metadata={"missing_days": [str(d) for d in missing]}
+            passed=result.passed, severity=AssetCheckSeverity[result.severity], metadata=result.metadata
         )
 
-    return delivery
+    return run_check
 
 
 def build_table_asset(dataset: Dataset, table: Table):
     @asset(
-        key=table_key(table),
-        deps=[raw_key(dataset.feed)],
+        key=table.asset_key,
+        deps=[dataset.feed.raw_key],
         group_name=dataset.feed.name,
         partitions_def=PARTITIONS[table.partition](start_date=table.start_date),
         required_resource_keys={"manifest", "sql"},
         description=f"{type(table.loader).__name__} on {', '.join(table.select)}",
+        # tables of one dataset share a dlt pipeline; limit this key to 1 in the instance to serialize their loads
+        op_tags={"dagster/concurrency_key": f"load_{dataset.name}"},
     )
     def sql_table(context: AssetExecutionContext) -> MaterializeResult:
         manifest: Manifest = context.resources.manifest
-        sql: Sql = context.resources.sql
         window = context.partition_time_window
         files = manifest.files_for(table.key, window.start.date(), window.end.date())
         if not files:
             return MaterializeResult(metadata={"rows": 0, "files": 0})
-        result = load(table, files, sql.url, sql.dataset_name, context.run_id, dataset.schema_dir)
+        result = load(dataset, table, files, context.resources.sql.url, context.run_id)
         manifest.mark_loaded([f.id for f in files], context.run_id)
         return MaterializeResult(
             metadata={"rows": result["rows"], "files": len(files), "dlt_load_ids": result["load_ids"]}
@@ -127,8 +120,8 @@ def build_load_sensor(dataset: Dataset):
     tables = dataset.tables
 
     @sensor(
-        name=f"load_{dataset.feed.name}",
-        target=AssetSelection.keys(*[table_key(t) for t in tables]),
+        name=dataset.load_sensor_name,
+        target=AssetSelection.assets(*[t.asset_key for t in tables]),
         minimum_interval_seconds=300,
     )
     def load_sensor(manifest: Manifest):
@@ -140,7 +133,7 @@ def build_load_sensor(dataset: Dataset):
             for key, newest_file in pending.items():
                 yield RunRequest(
                     run_key=f"{t.key}/{key}/{newest_file}",  # a later revision yields a new key, so it is reloaded
-                    asset_selection=[table_key(t)],
+                    asset_selection=[t.asset_key],
                     partition_key=key,
                 )
 
@@ -151,10 +144,10 @@ def build_dataset(dataset: Dataset) -> Definitions:
     feed = dataset.feed
     defs = Definitions(
         assets=[build_raw_asset(dataset), *(build_table_asset(dataset, t) for t in dataset.tables)],
-        asset_checks=[build_delivery_check(dataset, t) for t in dataset.tables],
+        asset_checks=[build_check(dataset, t, c) for t in dataset.tables for c in t.checks],
         schedules=[
             ScheduleDefinition(
-                name=f"sync_{feed.name}", cron_schedule=feed.cron, target=AssetSelection.keys(raw_key(feed))
+                name=dataset.sync_schedule_name, cron_schedule=feed.cron, target=AssetSelection.assets(feed.raw_key)
             )
         ],
         sensors=[build_load_sensor(dataset)] if dataset.tables else [],
