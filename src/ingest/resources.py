@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 
 import fsspec
@@ -37,6 +38,12 @@ class Landing(ConfigurableResource):
         return Path(self.root, feed, relative + suffix)
 
 
+class FileStatus(str, Enum):
+    DOWNLOADED = "downloaded"  # present in the landing area, newest version of its remote path
+    SUPERSEDED = "superseded"  # replaced by a newer version of the same remote path
+    IGNORED = "ignored"  # seen on the remote, excluded by the feed, never downloaded
+
+
 metadata = sa.MetaData()
 
 files = sa.Table(
@@ -48,7 +55,7 @@ files = sa.Table(
     sa.Column("remote_mtime", sa.String(40)),
     sa.Column("size", sa.BigInteger),
     sa.Column("version", sa.Integer, nullable=False, default=1),
-    sa.Column("status", sa.String(20), nullable=False),  # downloaded | superseded | ignored
+    sa.Column("status", sa.Enum(FileStatus, native_enum=False, length=20), nullable=False),
     sa.Column("local_path", sa.String(1000)),
     sa.Column("sha256", sa.String(64)),
     sa.Column("downloaded_at", sa.DateTime),
@@ -75,7 +82,7 @@ class Manifest(ConfigurableResource):
 
     def latest(self, feed: str) -> dict[str, sa.Row]:
         """Newest known row per remote path (downloaded or ignored)."""
-        stmt = sa.select(files).where(files.c.feed == feed, files.c.status != "superseded")
+        stmt = sa.select(files).where(files.c.feed == feed, files.c.status != FileStatus.SUPERSEDED)
         with self.engine().connect() as conn:
             return {row.remote_path: row for row in conn.execute(stmt)}
 
@@ -85,7 +92,7 @@ class Manifest(ConfigurableResource):
                 conn.execute(
                     sa.update(files)
                     .where(files.c.feed == row["feed"], files.c.remote_path == row["remote_path"])
-                    .values(status="superseded")
+                    .values(status=FileStatus.SUPERSEDED)
                 )
             conn.execute(sa.insert(files).values(**row))
 
@@ -98,7 +105,7 @@ class Manifest(ConfigurableResource):
         with self.engine().begin() as conn:
             unassigned = conn.execute(
                 sa.select(files.c.id, files.c.feed, files.c.remote_path).where(
-                    files.c.status == "downloaded", files.c.table.is_(None)
+                    files.c.status == FileStatus.DOWNLOADED, files.c.table.is_(None)
                 )
             ).all()
             for row in unassigned:
@@ -130,7 +137,7 @@ class Manifest(ConfigurableResource):
                 files.c.table == table,
                 files.c.business_date >= start,
                 files.c.business_date < end,
-                files.c.status == "downloaded",
+                files.c.status == FileStatus.DOWNLOADED,
             )
             .order_by(files.c.business_date, files.c.id)
         )
@@ -141,7 +148,7 @@ class Manifest(ConfigurableResource):
         """Business dates with unloaded files -> highest pending file id (changes when a revision arrives)."""
         stmt = (
             sa.select(files.c.business_date, sa.func.max(files.c.id))
-            .where(files.c.table == table, files.c.status == "downloaded", files.c.loaded_at.is_(None))
+            .where(files.c.table == table, files.c.status == FileStatus.DOWNLOADED, files.c.loaded_at.is_(None))
             .group_by(files.c.business_date)
         )
         with self.engine().connect() as conn:
@@ -154,7 +161,7 @@ class Manifest(ConfigurableResource):
     def file_counts(self, table: str, since: date) -> dict[date, int]:
         stmt = (
             sa.select(files.c.business_date, sa.func.count())
-            .where(files.c.table == table, files.c.status == "downloaded", files.c.business_date >= since)
+            .where(files.c.table == table, files.c.status == FileStatus.DOWNLOADED, files.c.business_date >= since)
             .group_by(files.c.business_date)
         )
         with self.engine().connect() as conn:

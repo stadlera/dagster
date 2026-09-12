@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import fsspec
 
 from ingest.config import Feed
-from ingest.resources import Landing, Manifest, utcnow
+from ingest.resources import FileStatus, Landing, Manifest, utcnow
 
 
 @dataclass
@@ -39,7 +39,11 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
                 result.ignored += 1
                 if prev is None:
                     manifest.record(
-                        feed=feed.name, remote_path=remote_path, remote_mtime=mtime, size=size, status="ignored"
+                        feed=feed.name,
+                        remote_path=remote_path,
+                        remote_mtime=mtime,
+                        size=size,
+                        status=FileStatus.IGNORED,
                     )
                 continue
 
@@ -61,7 +65,7 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
                 remote_mtime=mtime,
                 size=size,
                 version=version,
-                status="downloaded",
+                status=FileStatus.DOWNLOADED,
                 local_path=str(local),
                 sha256=_sha256(local),
                 downloaded_at=utcnow(),

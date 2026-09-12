@@ -50,7 +50,8 @@ def build_raw_asset(dataset: Dataset):
     )
     def raw(context: AssetExecutionContext) -> MaterializeResult:
         manifest: Manifest = context.resources.manifest
-        result = sync(getattr(context.resources, remote_key).fs(), feed, context.resources.landing, manifest)
+        landing = Landing(root=dataset.landing_root) if dataset.landing_root else context.resources.landing
+        result = sync(getattr(context.resources, remote_key).fs(), feed, landing, manifest)
         classified = manifest.classify(tables)
         context.log.info(
             "%s: %d new, %d revisions, %d unchanged, %d ignored, %d classified",
@@ -107,7 +108,7 @@ def build_table_asset(dataset: Dataset, table: Table):
         files = manifest.files_for(table.key, window.start.date(), window.end.date())
         if not files:
             return MaterializeResult(metadata={"rows": 0, "files": 0})
-        result = load(dataset, table, files, context.resources.sql.url, context.run_id)
+        result = load(dataset, table, files, dataset.sql_url or context.resources.sql.url, context.run_id)
         manifest.mark_loaded([f.id for f in files], context.run_id)
         return MaterializeResult(
             metadata={"rows": result["rows"], "files": len(files), "dlt_load_ids": result["load_ids"]}

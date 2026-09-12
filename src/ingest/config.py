@@ -101,6 +101,9 @@ class Dataset:
     tables: tuple[Table, ...] = ()
     schema_dir: Path = Path("schemas")  # <schema_dir>/import/<feed>.schema.yaml is committed, export/ is generated
     sql_schema: str | None = None  # SQL schema holding all tables of this dataset; defaults to the feed name
+    # per-dataset overrides of the shared resources, e.g. EnvVar("X_LANDING_ROOT").get_value()
+    landing_root: str | None = None
+    sql_url: str | None = None
     extra: Definitions | None = None  # custom assets, sensors or schedules for this dataset
 
     def __post_init__(self) -> None:

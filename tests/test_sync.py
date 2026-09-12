@@ -18,7 +18,7 @@ from ingest.config import Dataset, Feed, Table, Upsert
 from ingest.factory import build_definitions
 from ingest.load import load
 from ingest.loaders import AvroLoader, JsonLoader
-from ingest.resources import AmbiguousMatch, Landing, Manifest, Remote, Sql
+from ingest.resources import AmbiguousMatch, FileStatus, Landing, Manifest, Remote, Sql
 from ingest.schema import committed_types, profile, write_schema
 from ingest.sync import sync
 
@@ -63,7 +63,7 @@ def test_sync_is_byte_equivalent_and_idempotent(env):
 
     second = sync(fs, feed, landing, manifest)
     assert second.downloaded == [] and second.unchanged == 2 and second.ignored == 1
-    assert manifest.latest(feed.name)[str(remote / "em.csv")].status == "ignored"
+    assert manifest.latest(feed.name)[str(remote / "em.csv")].status == FileStatus.IGNORED
 
 
 def test_classify_assigns_table_and_business_date_after_the_fact(env):
