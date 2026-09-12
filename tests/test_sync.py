@@ -2,6 +2,7 @@ import gzip
 import os
 import time
 import zipfile
+from dataclasses import replace
 from datetime import date
 
 import dlt
@@ -11,14 +12,15 @@ import pyarrow as pa
 import pytest
 import sqlalchemy as sa
 import yaml
-from dagster import AssetKey, Definitions, asset
+from dagster import AssetKey, Definitions, asset, materialize
+from dagster._core.storage.tags import ASSET_PARTITION_RANGE_END_TAG, ASSET_PARTITION_RANGE_START_TAG
 
-from ingest.checks import CheckContext, CheckResult, Delivery, Weekdays
+from ingest.checks import CheckContext, CheckResult, Delivery, Monthly, NthWeekday, Weekdays, Weekly
 from ingest.config import Dataset, Feed, Table, Upsert
-from ingest.factory import build_definitions
+from ingest.factory import build_definitions, partition_ranges, partitions_def
 from ingest.load import load
 from ingest.loaders import AvroLoader, JsonLoader
-from ingest.resources import AmbiguousMatch, FileStatus, Landing, Manifest, Remote, Sql
+from ingest.resources import AmbiguousMatch, FileStatus, Landing, Manifest, Remote, Sql, files
 from ingest.schema import committed_types, profile, write_schema
 from ingest.sync import sync
 
@@ -305,3 +307,128 @@ def test_extra_definitions_wire_into_factory_keys(tmp_path):
     assert graph.get(AssetKey("em_report")).parent_keys == {table.asset_key}
     assert {c.name for c in graph.asset_check_keys} == {"delivery_em", "row_count"}
     assert defs.get_schedule_def(dataset.sync_schedule_name) and defs.get_sensor_def(dataset.load_sensor_name)
+
+
+# --- logical identity, archives, collisions ------------------------------------------------------
+
+ARCHIVED = Table(
+    "tradeweb",
+    "em",
+    select=(r"em-(?P<date>\d{4}-\d{2}-\d{2})\.csv$",),  # anchored on the file name: also matches zip members
+    archives=(r"/em-\d{4}\.zip$",),
+)
+
+
+def statuses(manifest, remote):
+    """status by remote path relative to the remote dir; archive members appear as '<archive>!<member>'"""
+    with manifest.engine().connect() as conn:
+        rows = conn.execute(sa.select(files.c.remote_path, files.c.status)).all()
+    return {p.replace(f"{remote}/", ""): st for p, st in rows}
+
+
+def test_yearly_archive_members_dedupe_against_daily_files_and_fill_gaps(env, tmp_path):
+    fs, feed, landing, manifest, remote = env
+    with zipfile.ZipFile(remote / "em-2026.zip", "w") as z:
+        z.writestr("em-2026-09-07.csv", "isin,price\nXS0,0.5\n")  # not delivered as daily file: fills the gap
+        z.writestr("em-2026-09-08.csv", (remote / "em-2026-09-08.csv").read_bytes())  # identical repack
+        z.writestr("em-2026-09-09.csv", "isin,price\nXS1,9.9\n")  # restated
+    sync(fs, feed, landing, manifest)
+    assert manifest.classify([ARCHIVED]) == 5
+
+    st = statuses(manifest, remote)
+    assert st["em-2026.zip"] == FileStatus.EXPANDED
+    assert st["em-2026-09-08.csv"] == FileStatus.DOWNLOADED  # daily stays ...
+    assert st["em-2026.zip!em-2026-09-08.csv"] == FileStatus.DUPLICATE  # ... the identical member is a duplicate
+    assert st["em-2026-09-09.csv"] == FileStatus.SUPERSEDED
+    assert manifest.pending_days(ARCHIVED.key).keys() == {date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 9)}
+    active_09 = manifest.files_for(ARCHIVED.key, date(2026, 9, 9))
+    assert len(active_09) == 1 and active_09[0].member == "em-2026-09-09.csv"  # restatement superseded the daily
+
+    run_load(tmp_path, manifest, ARCHIVED, date(2026, 9, 7), "run-1", end=date(2026, 9, 10))
+    assert query(tmp_path, "select isin, price, _business_date from em order by _business_date") == [
+        ("XS0", 0.5, "2026-09-07"),
+        ("XS1", 1.0, "2026-09-08"),
+        ("XS1", 9.9, "2026-09-09"),
+    ]
+    assert manifest.classify([ARCHIVED]) == 0  # idempotent: nothing re-expanded or re-assigned
+
+
+def test_moved_file_with_same_content_is_a_duplicate(env):
+    fs, feed, landing, manifest, remote = env
+    sync(fs, feed, landing, manifest)
+    manifest.classify([ARCHIVED])
+    (remote / "archive").mkdir()
+    (remote / "archive" / "em-2026-09-08.csv").write_bytes((remote / "em-2026-09-08.csv").read_bytes())
+    feed = Feed(name="tradeweb", remote=feed.remote, cron=feed.cron, paths=feed.paths, maxdepth=2, exclude=feed.exclude)
+    sync(fs, feed, landing, manifest)
+    manifest.classify([ARCHIVED])
+    assert len(manifest.files_for(ARCHIVED.key, date(2026, 9, 8))) == 1
+    with manifest.engine().connect() as conn:
+        dup = conn.execute(sa.select(files.c.status).where(files.c.remote_path.like("%archive%"))).scalar()
+    assert dup == FileStatus.DUPLICATE
+
+
+def test_keep_first_policy_and_custom_identity(env):
+    fs, feed, landing, manifest, remote = env
+    (remote / "em-2026-09-08_corrected.csv").write_bytes(b"isin,price\nXS1,1.5\n")
+    sync(fs, feed, landing, manifest)
+    table = Table(
+        "tradeweb",
+        "em",
+        select=(r"em-(?P<date>\d{4}-\d{2}-\d{2})(?P<suffix>_corrected)?\.csv$",),
+        identity=lambda m, path: m.group("date"),  # the suffix is not part of the identity
+        on_collision="first",
+    )
+    manifest.classify([table])
+    active = manifest.files_for(table.key, date(2026, 9, 8))
+    assert [os.path.basename(f.remote_path) for f in active] == ["em-2026-09-08.csv"]
+    assert statuses(manifest, remote)["em-2026-09-08_corrected.csv"] == FileStatus.SUPERSEDED
+
+
+# --- partitions and range runs ---------------------------------------------------------------------
+
+
+def test_partition_ranges_are_contiguous_and_capped():
+    pdef = partitions_def(TABLE)
+    pending = {"2026-09-01": 1, "2026-09-02": 5, "2026-09-03": 2, "2026-09-07": 9, "2026-09-08": 3}
+    assert partition_ranges(pdef, pending, 31) == [("2026-09-01", "2026-09-03", 5), ("2026-09-07", "2026-09-08", 9)]
+    assert partition_ranges(pdef, pending, 2) == [
+        ("2026-09-01", "2026-09-02", 5),
+        ("2026-09-03", "2026-09-03", 2),
+        ("2026-09-07", "2026-09-08", 9),
+    ]
+    yearly = partitions_def(Table("tradeweb", "y", select=(), partition="yearly", start_date="2024-01-01"))
+    assert partition_ranges(yearly, {"2024-01-01": 1, "2025-01-01": 2}, 31) == [("2024-01-01", "2025-01-01", 2)]
+
+
+def test_range_run_loads_all_partitions_in_one_dlt_load(env, tmp_path):
+    fs, feed, landing, manifest, remote = env
+    sync(fs, feed, landing, manifest)
+    manifest.classify([TABLE])
+    dataset = Dataset(replace(feed, cron="0 7 * * *"), (TABLE,), schema_dir=tmp_path / "schemas")
+    defs = build_definitions(
+        [dataset], Landing(root=str(landing.root)), manifest, Sql(url=f"sqlite:///{tmp_path}/warehouse.db")
+    )
+    result = materialize(
+        [defs.get_assets_def(TABLE.asset_key)],
+        resources=defs.resources,
+        tags={ASSET_PARTITION_RANGE_START_TAG: "2026-09-07", ASSET_PARTITION_RANGE_END_TAG: "2026-09-10"},
+    )
+    assert result.success
+    assert query(tmp_path, "select _business_date from em order by 1") == [("2026-09-08",), ("2026-09-09",)]
+    assert manifest.pending_days(TABLE.key) == {}
+
+
+# --- calendars --------------------------------------------------------------------------------------
+
+
+def test_calendars():
+    sept = (date(2026, 9, 1), date(2026, 9, 30))
+    assert Weekly(weekday=5).days(*sept) == [date(2026, 9, d) for d in (5, 12, 19, 26)]
+    assert NthWeekday((1, 3), weekday=5).days(*sept) == [date(2026, 9, 5), date(2026, 9, 19)]
+    assert Monthly(day=15).days(date(2026, 8, 1), date(2026, 10, 1)) == [date(2026, 8, 15), date(2026, 9, 15)]
+
+    # monthly files, lag of 15 days: on Sept 10 the August file is due, the September one is not
+    delivery = Delivery(Monthly(day=1), lag_days=15, occurrences=2)
+    result = evaluate(delivery, {date(2026, 7, 1): 1}, today=date(2026, 9, 10))
+    assert result.metadata["violations"] == {"2026-08-01": 0} and result.severity == "WARN"

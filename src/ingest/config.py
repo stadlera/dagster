@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable, Literal
 
 from dagster import AssetKey, Definitions
 
@@ -57,9 +58,17 @@ class Table:
     # Other named groups become metadata columns, e.g. (?P<region>emea|apac) -> _region.
     select: tuple[str, ...]
     ignore: tuple[str, ...] = ()  # downloaded, but never loaded into this table
+    # archives holding several logical files (e.g. a yearly repack): members are classified individually
+    # by the select patterns, so anchor those on the file name, not on the folder
+    archives: tuple[str, ...] = ()
+    # logical identity of a file: default is business date + named groups. Two files with the same
+    # identity are the same file (moved, repacked, restated). Custom: fn(match, remote_path) -> str
+    identity: Callable[[re.Match, str], str] | None = None
+    on_collision: Literal["latest", "first"] = "latest"  # same identity, different content: which one is active
     date_format: str = "%Y-%m-%d"
     start_date: str = "2026-01-01"
-    partition: str = "daily"  # daily | monthly: one load run covers all files with a business date in the window
+    partition: Literal["daily", "weekly", "monthly", "yearly"] = "daily"  # one load covers the partition window
+    max_partitions_per_run: int = 31  # the load sensor groups pending partitions into range runs up to this size
     loader: Loader = field(default_factory=CsvLoader)
     merge: ReplaceDay | Upsert = field(default_factory=ReplaceDay)
     checks: tuple[Check, ...] = (Delivery(),)

@@ -14,7 +14,8 @@ Dagster ingestion of external finance datasets.
       loaders.py           CsvLoader, ParquetLoader, JsonLoader, AvroLoader, FunctionLoader (stream -> arrow/dicts)
       load.py              open landed files (zip/tar members and gz via fsspec), add metadata, dlt merge
       schema.py            committed schema: profiler proposes a dlt schema YAML, loaders read with its types
-      checks.py            Check protocol, calendars, Delivery expectation builder
+      checks.py            Check protocol, calendars (Exchange, Weekdays, Weekly, NthWeekday, Monthly, Yearly), Delivery
+      archives.py          list archive members with hashes, open one member as a stream
       factory.py           Dataset -> assets, delivery checks, sync schedule, load sensor
       definitions.py       Dagster entry point: shared resources + all discovered datasets
       profile.py           CLI: uv run python -m ingest.profile <feed>/<table>
@@ -71,8 +72,28 @@ Several `select` patterns may feed one table; `ignore` patterns exclude files fr
 matching two tables fails classification. The named group `date` is the business date, every
 other named group becomes a `_<name>` column.
 
-`partition="monthly"` on a Table makes one load run cover all business dates of the month.
-Empty partitions materialize with zero rows; missing deliveries are reported by the delivery check.
+`partition` on a Table is daily (default), weekly, monthly or yearly. Loads use a single-run backfill
+policy: the load sensor groups pending partitions into contiguous ranges (`max_partitions_per_run`,
+default 31) and one run loads the whole range. Empty partitions materialize with zero rows; missing
+deliveries are reported by the delivery check.
+
+## Logical files, archives and collisions
+
+Every classified row gets an `identity`: by default the business date plus the named groups of the
+select pattern, so a file keeps its identity when it is moved (retention folders) or repacked into an
+archive. `Table.identity = fn(match, remote_path) -> str` overrides the rule per table.
+
+When a new row has the identity of an active row:
+
+- same content hash: the new row becomes `duplicate` and is never loaded (moved file, identical repack)
+- different content: with `on_collision="latest"` (default) the old row is `superseded` and the
+  partition is reloaded (restatement); with `"first"` the new row is superseded and ignored.
+
+Archives are normally one logical file (a day's entities bundled) and are read as one unit. An archive
+holding several logical files (e.g. `em-2026.zip` with one member per day) is listed in
+`Table.archives`; classify then creates one manifest row per member (`<archive>!<member>`, status of
+the archive becomes `expanded`) and the select patterns classify members like plain files. Nothing is
+extracted to disk; members are read straight from the archive at load time.
 
 ## Schema workflow
 

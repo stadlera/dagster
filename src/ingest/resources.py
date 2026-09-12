@@ -39,8 +39,10 @@ class Landing(ConfigurableResource):
 
 
 class FileStatus(str, Enum):
-    DOWNLOADED = "downloaded"  # present in the landing area, newest version of its remote path
-    SUPERSEDED = "superseded"  # replaced by a newer version of the same remote path
+    DOWNLOADED = "downloaded"  # active: in the landing area, newest content of its logical identity
+    SUPERSEDED = "superseded"  # replaced by a newer version of the same remote path or logical identity
+    DUPLICATE = "duplicate"  # same logical identity and same content as an active row, never loaded
+    EXPANDED = "expanded"  # an archive whose members are tracked as their own rows
     IGNORED = "ignored"  # seen on the remote, excluded by the feed, never downloaded
 
 
@@ -59,10 +61,14 @@ files = sa.Table(
     sa.Column("local_path", sa.String(1000)),
     sa.Column("sha256", sa.String(64)),
     sa.Column("downloaded_at", sa.DateTime),
+    # archive members: parent is the archive row, member the path inside it, remote_path = "<archive>!<member>"
+    sa.Column("parent_id", sa.Integer, sa.ForeignKey("files.id")),
+    sa.Column("member", sa.String(1000)),
     # assigned by classify(), possibly long after download
     sa.Column("table", sa.String(200), index=True),
     sa.Column("business_date", sa.Date, index=True),
     sa.Column("attributes", sa.JSON),  # named groups of the matching select pattern
+    sa.Column("identity", sa.String(500), index=True),  # logical file: same identity = same file, whatever the path
     sa.Column("loaded_at", sa.DateTime),
     sa.Column("load_id", sa.String(100)),
 )
@@ -97,14 +103,16 @@ class Manifest(ConfigurableResource):
             conn.execute(sa.insert(files).values(**row))
 
     def classify(self, tables) -> int:
-        """Assign table, business_date and attributes to downloaded rows matching a table's select patterns.
-
+        """Assign table, business_date, attributes and identity to downloaded rows matching a table's select
+        patterns. Archives matching a table's `archives` patterns are expanded into member rows first.
+        Rows whose identity already exists become DUPLICATE (same content) or supersede the older row.
         Raises AmbiguousMatch (after committing the unambiguous ones) if a file matches more than one table.
         """
+        self._expand_archives(tables)
         assigned, ambiguous = 0, []
         with self.engine().begin() as conn:
             unassigned = conn.execute(
-                sa.select(files.c.id, files.c.feed, files.c.remote_path).where(
+                sa.select(files.c.id, files.c.feed, files.c.remote_path, files.c.sha256).where(
                     files.c.status == FileStatus.DOWNLOADED, files.c.table.is_(None)
                 )
             ).all()
@@ -113,20 +121,76 @@ class Manifest(ConfigurableResource):
                 if len(matches) > 1:
                     ambiguous.append((row.remote_path, [t.key for t, _ in matches]))
                     continue
-                if matches:
-                    t, m = matches[0]
-                    groups = m.groupdict()
-                    raw_date = groups.pop("date", None) or m.group(1)
-                    day = datetime.strptime(raw_date, t.date_format).date()
-                    conn.execute(
-                        sa.update(files)
-                        .where(files.c.id == row.id)
-                        .values(table=t.key, business_date=day, attributes=groups)
-                    )
-                    assigned += 1
+                if not matches:
+                    continue
+                t, m = matches[0]
+                groups = m.groupdict()
+                raw_date = groups.pop("date", None) or m.group(1)
+                day = datetime.strptime(raw_date, t.date_format).date()
+                identity = t.identity(m, row.remote_path) if t.identity else _default_identity(day, groups)
+                identity = f"{t.key}|{identity}"
+                status = self._resolve_collision(conn, t, row, identity)
+                conn.execute(
+                    sa.update(files)
+                    .where(files.c.id == row.id)
+                    .values(table=t.key, business_date=day, attributes=groups, identity=identity, status=status)
+                )
+                assigned += 1
         if ambiguous:
             raise AmbiguousMatch(ambiguous)
         return assigned
+
+    def _resolve_collision(self, conn, table, row, identity: str) -> FileStatus:
+        active = conn.execute(
+            sa.select(files.c.id, files.c.sha256).where(
+                files.c.identity == identity, files.c.status == FileStatus.DOWNLOADED, files.c.id != row.id
+            )
+        ).all()
+        if not active:
+            return FileStatus.DOWNLOADED
+        if any(a.sha256 == row.sha256 for a in active):
+            return FileStatus.DUPLICATE
+        if table.on_collision == "first":
+            return FileStatus.SUPERSEDED
+        conn.execute(
+            sa.update(files).where(files.c.id.in_([a.id for a in active])).values(status=FileStatus.SUPERSEDED)
+        )
+        return FileStatus.DOWNLOADED
+
+    def _expand_archives(self, tables) -> None:
+        from ingest.archives import list_members
+
+        patterns = {}
+        for t in tables:
+            patterns.setdefault(t.feed, []).extend(t.archives)
+        if not any(patterns.values()):
+            return
+        with self.engine().begin() as conn:
+            candidates = conn.execute(
+                sa.select(files).where(
+                    files.c.status == FileStatus.DOWNLOADED, files.c.table.is_(None), files.c.parent_id.is_(None)
+                )
+            ).all()
+            for row in candidates:
+                if not any(re.search(p, row.remote_path) for p in patterns.get(row.feed, [])):
+                    continue
+                for member in list_members(row.local_path):
+                    conn.execute(
+                        sa.insert(files).values(
+                            feed=row.feed,
+                            remote_path=f"{row.remote_path}!{member.name}",
+                            remote_mtime=row.remote_mtime,
+                            size=member.size,
+                            version=row.version,
+                            status=FileStatus.DOWNLOADED,
+                            local_path=row.local_path,
+                            sha256=member.sha256,
+                            downloaded_at=row.downloaded_at,
+                            parent_id=row.id,
+                            member=member.name,
+                        )
+                    )
+                conn.execute(sa.update(files).where(files.c.id == row.id).values(status=FileStatus.EXPANDED))
 
     def files_for(self, table: str, start: date, end: date | None = None) -> list[sa.Row]:
         """Downloaded files with start <= business_date < end (end defaults to the day after start)."""
@@ -166,6 +230,10 @@ class Manifest(ConfigurableResource):
         )
         with self.engine().connect() as conn:
             return dict(conn.execute(stmt).all())
+
+
+def _default_identity(day: date, attributes: dict) -> str:
+    return "|".join([str(day), *(f"{k}={v}" for k, v in sorted(attributes.items()))])
 
 
 def _match(table, remote_path: str) -> re.Match | None:

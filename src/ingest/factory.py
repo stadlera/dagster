@@ -4,7 +4,7 @@ Naming is defined in config.py (Feed.raw_key, Table.asset_key, Dataset.sync_sche
 Dataset.load_sensor_name); custom definitions in Dataset.extra can rely on it.
 """
 
-from datetime import date
+from datetime import date, datetime, time, timezone
 
 from dagster import (
     AssetCheckExecutionContext,
@@ -12,17 +12,22 @@ from dagster import (
     AssetCheckSeverity,
     AssetExecutionContext,
     AssetSelection,
+    BackfillPolicy,
     DailyPartitionsDefinition,
     Definitions,
     MaterializeResult,
     MonthlyPartitionsDefinition,
+    PartitionKeyRange,
     RetryPolicy,
     RunRequest,
     ScheduleDefinition,
+    TimeWindowPartitionsDefinition,
+    WeeklyPartitionsDefinition,
     asset,
     asset_check,
     sensor,
 )
+from dagster._core.storage.tags import ASSET_PARTITION_RANGE_END_TAG, ASSET_PARTITION_RANGE_START_TAG
 
 from ingest.checks import Check, CheckContext
 from ingest.config import Dataset, Table
@@ -30,11 +35,38 @@ from ingest.load import load
 from ingest.resources import Landing, Manifest, Sql
 from ingest.sync import sync
 
-PARTITIONS = {"daily": DailyPartitionsDefinition, "monthly": MonthlyPartitionsDefinition}
+
+def partitions_def(table: Table) -> TimeWindowPartitionsDefinition:
+    start = table.start_date
+    if table.partition == "yearly":
+        return TimeWindowPartitionsDefinition(start=start, cron_schedule="0 0 1 1 *", fmt="%Y-%m-%d")
+    cls = {
+        "daily": DailyPartitionsDefinition,
+        "weekly": WeeklyPartitionsDefinition,
+        "monthly": MonthlyPartitionsDefinition,
+    }
+    return cls[table.partition](start_date=start)
 
 
-def partition_key(table: Table, day: date) -> str:
-    return str(day.replace(day=1) if table.partition == "monthly" else day)
+def partition_ranges(
+    pdef: TimeWindowPartitionsDefinition, pending: dict[str, int], max_size: int
+) -> list[tuple[str, str, int]]:
+    """Group pending partition keys (-> newest file id) into contiguous ranges of at most max_size keys.
+    Returns (start_key, end_key, newest_file_id) triples."""
+    if not pending:
+        return []
+    keys = pdef.get_partition_keys_in_range(PartitionKeyRange(min(pending), max(pending)))
+    ranges, current = [], []
+    for key in keys:
+        if key in pending and len(current) < max_size:
+            current.append(key)
+        else:
+            if current:
+                ranges.append(current)
+            current = [key] if key in pending else []
+    if current:
+        ranges.append(current)
+    return [(r[0], r[-1], max(pending[k] for k in r)) for r in ranges]
 
 
 def build_raw_asset(dataset: Dataset):
@@ -96,7 +128,8 @@ def build_table_asset(dataset: Dataset, table: Table):
         key=table.asset_key,
         deps=[dataset.feed.raw_key],
         group_name=dataset.feed.name,
-        partitions_def=PARTITIONS[table.partition](start_date=table.start_date),
+        partitions_def=partitions_def(table),
+        backfill_policy=BackfillPolicy.single_run(),  # a range of partitions is one load
         required_resource_keys={"manifest", "sql"},
         description=f"{type(table.loader).__name__} on {', '.join(table.select)}",
         # tables of one dataset share a dlt pipeline; limit this key to 1 in the instance to serialize their loads
@@ -108,8 +141,8 @@ def build_table_asset(dataset: Dataset, table: Table):
         files = manifest.files_for(table.key, window.start.date(), window.end.date())
         if not files:
             return MaterializeResult(metadata={"rows": 0, "files": 0})
-        result = load(dataset, table, files, dataset.sql_url or context.resources.sql.url, context.run_id)
-        manifest.mark_loaded([f.id for f in files], context.run_id)
+        result = load(dataset, table, files, dataset.sql_url or context.resources.sql.url, context.run.run_id)
+        manifest.mark_loaded([f.id for f in files], context.run.run_id)
         return MaterializeResult(
             metadata={"rows": result["rows"], "files": len(files), "dlt_load_ids": result["load_ids"]}
         )
@@ -127,15 +160,18 @@ def build_load_sensor(dataset: Dataset):
     )
     def load_sensor(manifest: Manifest):
         for t in tables:
+            pdef = partitions_def(t)
             pending: dict[str, int] = {}  # partition key -> newest pending file id
             for day, newest_file in manifest.pending_days(t.key).items():
-                key = partition_key(t, day)
+                timestamp = datetime.combine(day, time.min, timezone.utc).timestamp()
+                key = pdef.get_partition_key_for_timestamp(timestamp)
                 pending[key] = max(pending.get(key, 0), newest_file)
-            for key, newest_file in pending.items():
+            for start, end, newest_file in partition_ranges(pdef, pending, t.max_partitions_per_run):
                 yield RunRequest(
-                    run_key=f"{t.key}/{key}/{newest_file}",  # a later revision yields a new key, so it is reloaded
+                    # a later revision yields a new key, so it is reloaded
+                    run_key=f"{t.key}/{start}/{end}/{newest_file}",
                     asset_selection=[t.asset_key],
-                    partition_key=key,
+                    tags={ASSET_PARTITION_RANGE_START_TAG: start, ASSET_PARTITION_RANGE_END_TAG: end},
                 )
 
     return load_sensor

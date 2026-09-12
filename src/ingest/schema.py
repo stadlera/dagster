@@ -106,12 +106,12 @@ class ColumnStats:
 def profile(dataset: Dataset, table: Table, files: list, max_rows: int = 200_000) -> Schema:
     """Read up to max_rows per file through the table's loader (all text for CSV) and propose the table's
     columns. Returns the dataset schema with this table replaced; other tables are kept."""
-    from ingest.load import open_streams
+    from ingest.archives import open_streams
 
     stats: dict[str, ColumnStats] = {}
     for f in files:
         rows = 0
-        for stream in open_streams(Path(f.local_path)):
+        for stream in open_streams(Path(f.local_path), f.member):
             with stream:
                 for batch in table.loader.read(stream, column_types="string"):
                     if not isinstance(batch, pa.Table):

@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from ingest.config import Table
     from ingest.resources import Manifest, Sql
 
-LOOKBACK_DAYS = 7
+MAX_LOOKBACK_DAYS = 400  # far enough back to find the last occurrences of a yearly calendar
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,59 @@ class Weekdays:
 
 
 @dataclass(frozen=True)
+class Weekly:
+    """One business date per week on the given weekday (0 = Monday)."""
+
+    weekday: int = 4
+    holidays: tuple[date, ...] = ()
+
+    def days(self, start, end):
+        days = [start + timedelta(i) for i in range((end - start).days + 1)]
+        return [d for d in days if d.weekday() == self.weekday and d not in self.holidays]
+
+
+@dataclass(frozen=True)
+class NthWeekday:
+    """E.g. NthWeekday((1, 3), weekday=5): the first and third Saturday of every month."""
+
+    occurrences: tuple[int, ...]
+    weekday: int
+    holidays: tuple[date, ...] = ()
+
+    def days(self, start, end):
+        days = [start + timedelta(i) for i in range((end - start).days + 1)]
+        return [
+            d
+            for d in days
+            if d.weekday() == self.weekday and (d.day - 1) // 7 + 1 in self.occurrences and d not in self.holidays
+        ]
+
+
+@dataclass(frozen=True)
+class Monthly:
+    """One business date per month, e.g. the period start (day=1) of monthly files."""
+
+    day: int = 1
+
+    def days(self, start, end):
+        days = [start + timedelta(i) for i in range((end - start).days + 1)]
+        return [d for d in days if d.day == self.day]
+
+
+@dataclass(frozen=True)
+class Yearly:
+    month: int = 1
+    day: int = 1
+
+    def days(self, start, end):
+        return [
+            date(y, self.month, self.day)
+            for y in range(start.year, end.year + 1)
+            if start <= date(y, self.month, self.day) <= end
+        ]
+
+
+@dataclass(frozen=True)
 class Exchange:
     """Trading sessions of an exchange_calendars calendar, e.g. XLON, XNYS, XFRA."""
 
@@ -74,12 +127,14 @@ class Exchange:
 
 @dataclass(frozen=True)
 class Delivery:
-    """Every calendar day up to today - lag_days must have between min_files and max_files files."""
+    """The last `occurrences` calendar days due by today - lag_days must each have between
+    min_files and max_files active files."""
 
     calendar: Calendar = field(default_factory=Exchange)
     lag_days: int = 1
     min_files: int = 1
     max_files: int | None = None
+    occurrences: int = 5
     name: str = "delivery"
     target: Literal["raw", "sql"] = "raw"
 
@@ -93,15 +148,17 @@ class Delivery:
 
     def evaluate(self, ctx: CheckContext) -> CheckResult:
         last_due = ctx.today - timedelta(days=self.lag_days)
-        start = last_due - timedelta(days=LOOKBACK_DAYS)
-        counts = ctx.manifest.file_counts(ctx.table.key, start)
+        due = self.calendar.days(last_due - timedelta(days=MAX_LOOKBACK_DAYS), last_due)[-self.occurrences :]
+        if not due:
+            return CheckResult(passed=True, metadata={"violations": {}})
+        counts = ctx.manifest.file_counts(ctx.table.key, due[0])
         bad = {
             d: counts.get(d, 0)
-            for d in self.calendar.days(start, last_due)
+            for d in due
             if counts.get(d, 0) < self.min_files or (self.max_files is not None and counts.get(d, 0) > self.max_files)
         }
-        # only the newest due day is missing: warn, it may just be late. Anything else: error.
-        severity = "WARN" if list(bad) == [last_due] and bad[last_due] == 0 else "ERROR"
+        # only the newest due occurrence is missing: warn, it may just be late. Anything else: error.
+        severity = "WARN" if list(bad) == [due[-1]] and bad[due[-1]] == 0 else "ERROR"
         return CheckResult(
             passed=not bad, severity=severity, metadata={"violations": {str(d): n for d, n in bad.items()}}
         )

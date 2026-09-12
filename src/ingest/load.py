@@ -8,16 +8,15 @@ contains (delete-insert on _business_date) unless the table merges on a business
 from __future__ import annotations
 
 import os
-import re
 import tempfile
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import Iterator
 
 import dlt
-import fsspec
 import pyarrow as pa
 from dlt.common.libs.pyarrow import get_py_arrow_datatype
 
+from ingest.archives import open_streams
 from ingest.config import Dataset, Table, Upsert
 from ingest.schema import committed_types
 
@@ -26,8 +25,6 @@ os.environ.setdefault("SCHEMA__NAMING", "sql_cs_v1")
 
 # new tables and columns are added automatically, a changed data type fails the load
 CONTRACT = {"tables": "evolve", "columns": "evolve", "data_type": "freeze"}
-
-ARCHIVES = {".zip": "zip", ".tar": "tar", ".tar.gz": "tar", ".tgz": "tar"}
 
 
 def destination(url: str):
@@ -67,7 +64,7 @@ def load(dataset: Dataset, table: Table, files: list, destination_url: str, load
         for f in files:
             meta = {"_business_date": f.business_date, "_source_file": f.id, "_load_id": load_id}
             meta |= {f"_{k}": (f.attributes or {}).get(k) for k in table.attribute_names}
-            for stream in open_streams(Path(f.local_path)):
+            for stream in open_streams(Path(f.local_path), f.member):
                 with stream:
                     for batch in table.loader.read(stream, column_types):
                         yield with_metadata(batch, meta, metadata_fields)
@@ -84,17 +81,6 @@ def load(dataset: Dataset, table: Table, files: list, destination_url: str, load
     info.raise_on_failed_jobs()
     counts = pipeline.last_trace.last_normalize_info.row_counts
     return {"load_ids": info.loads_ids, "rows": sum(v for k, v in counts.items() if not k.startswith("_dlt"))}
-
-
-def open_streams(path: Path) -> Iterator[BinaryIO]:
-    """Binary streams for a landed file: archive members via fsspec chaining, compression inferred."""
-    name = re.sub(r"\.v\d+$", "", path.name)  # strip our revision suffix
-    archive = next((fs for ext, fs in ARCHIVES.items() if name.endswith(ext)), None)
-    if archive:
-        for f in sorted(fsspec.open_files(f"{archive}://**::file://{path.resolve()}", "rb"), key=lambda f: f.path):
-            yield f.open()
-    else:
-        yield fsspec.open(str(path), "rb", compression=fsspec.utils.infer_compression(name)).open()
 
 
 def with_metadata(batch: pa.Table | list[dict], meta: dict, fields: list[pa.Field]) -> pa.Table | list[dict]:
