@@ -76,7 +76,7 @@ def test_two_days_in_the_life_of_a_provider(tmp_path):
         [dataset], Landing(root=str(tmp_path / "landing")), manifest, Sql(url=f"sqlite:///{tmp_path}/wh.db")
     )
     raw, sql = defs.get_assets_def(feed.raw_key), defs.get_assets_def(table.asset_key)
-    sensor = defs.get_sensor_def(dataset.load_sensor_name)
+    sensor = defs.resolve_sensor_def(dataset.load_sensor_name)
 
     def run_raw():
         result = materialize([raw, *defs.asset_checks], resources=defs.resources)

@@ -24,7 +24,7 @@ def build(ws, *tables, extra=None):
 
 
 def run_sensor(defs, dataset, manifest):
-    sensor = defs.get_sensor_def(dataset.load_sensor_name)
+    sensor = defs.resolve_sensor_def(dataset.load_sensor_name)
     return list(sensor(build_sensor_context(instance=DagsterInstance.ephemeral(), resources={"manifest": manifest})))
 
 
@@ -39,7 +39,7 @@ def test_keys_and_extra_definitions_wire_into_the_factory(ws):
     assert ws.feed.raw_key == AssetKey(["raw", "tradeweb"]) and table.asset_key == AssetKey(["sql", "tradeweb", "em"])
     assert graph.get(AssetKey("em_report")).parent_keys == {table.asset_key}
     assert {c.name for c in graph.asset_check_keys} == {"delivery_em", "row_count"}
-    assert defs.get_schedule_def(dataset.sync_schedule_name).cron_schedule == "0 7 * * 1-5"
+    assert defs.resolve_schedule_def(dataset.sync_schedule_name).cron_schedule == "0 7 * * 1-5"
     assert set(defs.resources) == {"landing", "manifest", "sql", "remote_tradeweb"}
 
 

@@ -33,6 +33,15 @@ project_name = "ingest"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    "error::DeprecationWarning:ingest",
+    # dagster: single-run backfills are still flagged beta (used for range runs)
+    "ignore:Parameter `backfill_policy`:dagster._utils.warnings.BetaWarning",
+    # dagster's sqlite event log still calls utcfromtimestamp on python 3.12
+    "ignore:datetime.datetime.utcfromtimestamp:DeprecationWarning:dagster",
+    # dlt's sqlalchemy merge job (sqlite test destination only, mssql uses another job)
+    "ignore:implicitly coercing SELECT object:sqlalchemy.exc.SAWarning",
+]
 
 [tool.ruff]
 line-length = 120
