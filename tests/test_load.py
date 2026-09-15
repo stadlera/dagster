@@ -10,8 +10,9 @@ from dlt.pipeline.exceptions import PipelineStepFailed
 from conftest import deeper
 from ingest.load import metadata_columns
 from ingest.partitioning import Monthly
+from ingest.profiling import ProfileOptions, profile, write_schema
 from ingest.readers import JsonReader
-from ingest.schema import committed_types, profile, write_schema
+from ingest.schema import committed_types
 from ingest.sources import Patterns
 from ingest.writers import DltWriter, Upsert
 
@@ -127,19 +128,20 @@ def test_profile_proposes_a_schema_and_loads_read_with_the_committed_types(ws):
     ws.classify(table)
     dataset = ws.dataset(table)
 
-    path = write_schema(profile(dataset, table, ws.manifest.files_for(table.key, date(2026, 9, 8))), dataset)
+    files = ws.manifest.files_for(table.key, date(2026, 9, 8))
+    proposed = profile(dataset, table, files).schema.tables["em"]["columns"]
+    assert proposed["price"]["data_type"] == "double"  # decimals are opt-in
+    path = write_schema(profile(dataset, table, files, ProfileOptions(decimals=True)).schema, dataset)
     cols = yaml.safe_load(path.read_text())["tables"]["em"]["columns"]
     assert path.name == "tradeweb.schema.yaml"
-    assert cols["id"] == {"nullable": True, "data_type": "bigint"}
-    assert cols["price"] == {"nullable": True, "data_type": "decimal", "precision": 5, "scale": 3}
+    # the id has leading zeros: text, so the load keeps them
+    assert cols["id"] == {"nullable": True, "data_type": "text", "precision": 20, "description": "leading zeros"}
+    assert cols["price"] == {"nullable": True, "data_type": "decimal", "precision": 7, "scale": 3}  # 2 digits headroom
     assert cols["as_of"]["data_type"] == "date" and cols["note"] == {
         "nullable": True,
         "data_type": "text",
         "precision": 20,
     }
-
-    # review: the id has leading zeros, keep it as text
-    path.write_text(path.read_text().replace("data_type: bigint", "data_type: text\n        precision: 20"))
     caps = dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities()
     assert committed_types(dataset, table, caps)["id"].equals(__import__("pyarrow").string())
     assert table.writer.column_types(dataset, table, ws.sql_url)["id"].equals(__import__("pyarrow").string())
@@ -154,5 +156,5 @@ def test_profile_proposes_a_schema_and_loads_read_with_the_committed_types(ws):
     assert ws.load(table, date(2026, 9, 9)).details["new_columns"] == ["currency"]
     # profiling another table keeps the first one in the shared dataset schema
     other = ws.table("em2")
-    write_schema(profile(dataset, other, ws.manifest.files_for(table.key, date(2026, 9, 8))), dataset)
+    write_schema(profile(dataset, other, ws.manifest.files_for(table.key, date(2026, 9, 8))).schema, dataset)
     assert set(yaml.safe_load(path.read_text())["tables"]) >= {"em", "em2"}

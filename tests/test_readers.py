@@ -39,6 +39,18 @@ def test_csv_reads_with_committed_types_instead_of_inferring():
     assert all_text.to_pylist() == [{"id": "00123", "price": "1.50"}]
 
 
+def test_csv_dialect_quirks_and_date_formats():
+    data = b'id,note,d,t\n1,"a\nb",20260908,08/09/2026 10:30\n2,-,20260909,\n'
+    reader = CsvReader(newlines_in_values=True, null_values=("-", ""), date_formats=("%Y%m%d", "%d/%m/%Y %H:%M"))
+    types = {"d": pa.date32(), "t": pa.timestamp("s")}
+    t = read_all(reader, data, types)
+    assert t["note"].to_pylist() == ["a\nb", None] and t["d"].type == pa.date32()
+    assert [str(v) for v in t["d"].to_pylist()] == ["2026-09-08", "2026-09-09"]
+    assert str(t["t"][0].as_py()) == "2026-09-08 10:30:00" and t["t"][1].as_py() is None
+    t = read_all(CsvReader(quote_char=None), b'a,b\n"x,1\n')
+    assert t.to_pylist() == [{"a": '"x', "b": 1}]
+
+
 def test_json_avro_parquet_and_function_readers():
     assert read_all(JsonReader(), b'{"a": 1}\n{"a": 2}\n').to_pylist() == [{"a": 1}, {"a": 2}]
     assert read_all(JsonReader(), b'[{"a": 1}]').to_pylist() == [{"a": 1}]

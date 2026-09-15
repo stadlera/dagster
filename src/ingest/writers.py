@@ -6,7 +6,6 @@ BULK INSERT via a staging file) only has to implement the same two methods.
 
 from __future__ import annotations
 
-import os
 import tempfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator, Protocol
@@ -15,13 +14,10 @@ import dlt
 import pyarrow as pa
 from dlt.common.libs.pyarrow import get_py_arrow_datatype
 
-from ingest.schema import committed_schema, committed_types, schema_path
+from ingest.schema import committed_schema, committed_types, schema_path  # also sets the dlt naming convention
 
 if TYPE_CHECKING:
     from ingest.config import Dataset, Table
-
-# keep provider column names, only fix characters that are illegal in SQL identifiers
-os.environ.setdefault("SCHEMA__NAMING", "sql_cs_v1")
 
 Batch = pa.Table | list[dict]
 

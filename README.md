@@ -19,13 +19,16 @@ One table goes through five stages; each stage is configured by one object on th
     src/ingest/
       config.py            Feed / Table / Dataset and the asset key properties
       resources.py         Remote (any fsspec filesystem), Landing, Manifest (storage only), Sql
-      schema.py            committed schema: profiler proposes a dlt schema YAML, readers read with its types
+      schema.py            committed schema io: readers read with its types
+      profiling/           sample.py (typed batches per format, csv sniff), stats.py (per-column statistics),
+                           propose.py (statistics -> dlt columns); profile() returns schema + report
       factory.py           Dataset -> assets, checks, sync schedule, load sensor
       definitions.py       Dagster entry point: shared resources + all discovered datasets
-      profile.py           CLI: uv run python -m ingest.profile <feed>/<table>
+      profile.py           CLI: uv run python -m ingest.profile <feed>/<table> [--decimals --narrow ...]
       alerting.py          Notifier resource, run-failure and run-findings (checks, schema changes) sensors
       ops.py               operator helpers: reload / ignore / reclassify (also a CLI)
-      datasets/<name>/     `dataset = Dataset(...)`, custom Dagster objects, schemas/import/<feed>.schema.yaml
+      datasets/<name>/     `dataset = Dataset(...)`, custom Dagster objects, schemas/import/<feed>.schema.yaml,
+                           schemas/profile/<feed>.<table>.profile.json
 
 Dagster objects per dataset: one unpartitioned `raw/<feed>` asset (mirror + classify), one partitioned
 `sql/<feed>/<table>` asset per table, asset checks, a sync schedule and a load sensor.
@@ -74,15 +77,47 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
 ## Schema workflow
 
 1. Run the raw asset so files are landed and classified.
-2. `uv run python -m ingest.profile acme/prices` samples recent files and writes the table into
-   `datasets/acme/schemas/import/acme.schema.yaml` (other tables in the file are kept):
-   bigint / decimal(p,s) / date / timestamp are detected from the values, text gets a length bucket
-   (20, 50, 100, 255, 1000, else max).
-3. Review the YAML (e.g. keep identifiers with leading zeros as text, widen decimals), commit it.
+2. `uv run python -m ingest.profile acme/prices` samples recent files, proposes the table's columns into
+   `datasets/acme/schemas/import/acme.schema.yaml` (other tables in the file are kept) and writes the
+   evidence to `datasets/acme/schemas/profile/acme.prices.profile.json`. Both are committed.
+   - Files are sampled the way a load sees them. CSV is read as text and typed with arrow kernels
+     (bigint, double, bool, date, timestamp; leading zeros or thousands separators keep a column text).
+     Parquet keeps its types. JSON, Avro and other dict readers are denested by dlt with the table's
+     `max_nesting`, so child tables `<table>__<field>` are profiled and committed too.
+   - Opt-ins: `--decimals` (decimal(p,s) with two integer digits of headroom instead of double), `--narrow`
+     (int / smallint when the value range x10 fits), `--strict-nulls` (NOT NULL for columns without nulls in
+     the sample; `Upsert` keys are always NOT NULL), `--date-format %Y%m%d` (repeatable; the reader needs
+     the same `CsvReader(date_formats=...)`).
+   - Text length: several values all of one length -> that exact length; otherwise the smallest bucket
+     of 20, 50, 100, 255, 1000, 4000 above max length x 1.5 (`--text-headroom`); longer: unbounded.
+     A column whose type is not the obvious one carries the reason in `description`.
+   - The report holds per column: nulls, distinct, uniqueness per file and overall, files present in,
+     min/max and a histogram, string lengths, quirks (newlines, doubled quotes, backslash escapes,
+     surrounding whitespace, non-ASCII, null-like tokens such as `-`), categorical value counts; per CSV
+     file a dialect sniff (delimiter, quoting, line endings, ragged rows) with hints when the file
+     disagrees with the declared `CsvReader`.
+   - Per table: `volume` (rows per file, files and rows per business date) and `keys`: column sets that
+     are unique within every file (single columns, else pairs, else triples), whether they are unique
+     across the sample, the share of key values that recur in later files (`repeat_ratio`) and the churn
+     between consecutive files (new / dropped key values). `file_key_metadata` lists `_business_date`
+     plus every pattern attribute that varies between files of one date. `suggested` turns this into
+     `Upsert(keys)` when values recur (default: at least half) or `ReplaceDay` otherwise; it is a hint,
+     the writer stays your declaration.
+   - Report contract: `version`, files identified by manifest path (never id), JSON numbers for bigint
+     and double, exact strings for decimal / date / timestamp (parse with the column's
+     `proposed.data_type`). `ingest.profiling.load_report(dataset, table)` reads it back, e.g. for a
+     scenario test asserting `tables.em.volume.rows_per_file.min` or a range check derived from
+     `tables.em.columns.price.numeric`.
+3. Review the YAML (widen decimals, drop a fixed length that is a coincidence of the sample, drop `description`
+   lines if you like), commit YAML and report.
 4. Loads read with the committed types: CSV via pyarrow column types, JSON coerced by dlt,
    Parquet/Avro keep their own schema. New columns are added and reported as `new_columns` in the
    asset metadata plus a warning in the run log; add them to the YAML. A changed type fails the load.
    Widen a column by editing the YAML. Without a committed schema dlt infers freely per load.
+
+CSV null tokens (`""`, `NA`, `NULL`, `n/a`, `#N/A`, ...) are null in text columns as well as typed ones;
+`CsvReader(strings_can_be_null=False)` keeps them as text, `null_values=(...)` replaces the list. Quoting,
+escaping and newlines inside values are `CsvReader(quote_char, escape_char, double_quote, newlines_in_values)`.
 
 All tables of a dataset share one dlt pipeline and one SQL schema (`Dataset.sql_schema`, default:
 feed name). Loaded rows carry `_business_date`, `_subset`, `_source_file` (manifest id), `_load_id` (Dagster

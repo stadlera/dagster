@@ -23,8 +23,11 @@ Read README.md first: "Stages and layout", "Semantics worth knowing", "Provider 
 - The manifest never deletes rows and the landing area is never modified. New behaviour must preserve:
   reruns download nothing new, reloads never duplicate, every row is traceable to a manifest id.
 - sqlite locally, SQL Server in production: no dialect-specific SQL in the manifest; dlt handles the sink.
-- Nothing generated is committed: `landing/`, `*.db`, dlt work dirs. Committed schemas live in
-  `datasets/<name>/schemas/import/` and are written only by `ingest.profile`.
+- Nothing generated is committed: `landing/`, `*.db`, dlt work dirs. Committed schemas and profile reports
+  live in `datasets/<name>/schemas/import/` and `schemas/profile/` and are written only by `ingest.profile`.
+- Profiling is `profiling/`: `sample.py` (files -> typed arrow batches, one path per format), `stats.py`
+  (accumulators, no decisions), `propose.py` (statistics -> dlt column, every rule reads options). `schema.py`
+  is committed-schema io only. A new heuristic is a stat in `stats.py` plus a rule in `propose.py` plus a test.
 
 ## When changing behaviour
 

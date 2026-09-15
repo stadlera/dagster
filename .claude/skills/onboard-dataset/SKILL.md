@@ -41,8 +41,11 @@ Use the README "Provider patterns" table row by row. Rules of thumb:
    (`select subset, path, status from files where feed = '<feed>'`), confirm the naming facts.
 3. Add tables, materialize `raw/<feed>` again (classifies the mirrored files), check that
    `classified` in the asset metadata matches expectations and no `AmbiguousMatch` occurred.
-4. `uv run python -m ingest.profile <feed>/<table>`, review the YAML (leading zeros -> text, decimal
-   precision with headroom, dates), commit it.
+4. `uv run python -m ingest.profile <feed>/<table>` with the opt-ins the provider needs (`--decimals`,
+   `--narrow`, `--date-format`). Read the printed summary and the report's `hints` (csv dialect), `flags`
+   (quirks) and `unique_in_file` (candidate `Upsert` keys); fix the `CsvReader` and rerun if the dialect
+   disagreed. Review the YAML (widen decimals, fixed lengths that are a coincidence of the sample), commit
+   the YAML and the profile report.
 5. Load one partition from the UI, check `_business_date`, `_subset`, attribute columns and row counts.
 6. Scenario test: copy the shape of `tests/test_e2e.py` with the provider's real naming, covering at
    least one quirk from step 1 (a move, a restatement, a repack, or a second region). Use small
