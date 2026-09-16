@@ -1,6 +1,6 @@
 """Typed arrow batches from landed files, the way a load would see them: CSV text is typed with arrow
 kernels, Parquet keeps its types, dict rows (JSON, Avro, custom readers) are denested by dlt into parquet
-with the table's nesting settings, then typed the same way."""
+with the table's nesting settings, then typed the same way. Files are processed one at a time."""
 
 from __future__ import annotations
 
@@ -9,21 +9,23 @@ import csv
 import io
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
+import dlt
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from ingest.archives import open_streams
-from ingest.profiling.stats import all_midnight
+from ingest.profiling.arrow import all_midnight, flat
+from ingest.profiling.model import Column, FileInfo, Typed
 from ingest.readers import CsvReader
 
 if TYPE_CHECKING:
     from ingest.config import Table
-    from ingest.profiling.propose import ProfileOptions
+    from ingest.profiling.model import ProfileOptions
 
 INT = r"^-?\d+$"
 LEADING_ZEROS = r"^-?0\d"
@@ -39,82 +41,90 @@ SNIFF_BYTES = 1 << 18
 
 @dataclass
 class Sampled:
+    """One typed batch of one table (after denesting) from one file."""
+
     table: str  # table name after denesting (parent or <table>__<field>)
-    file: str  # manifest path (stable across environments, unlike the id)
+    file: FileInfo
     batch: pa.Table
-    evidence: dict[str, dict] = field(default_factory=dict)  # column -> typing pass result
-    raw: dict[str, pa.Array] = field(default_factory=dict)  # original strings of columns typed from text
+    typed: dict[str, Typed] = field(default_factory=dict)  # every column of the batch
     parent: str | None = None
-    meta: dict = field(default_factory=dict)  # business_date, attributes of the file
-
-
-def file_meta(f) -> dict:
-    return {"id": f.id, "business_date": f.business_date, "attributes": dict(f.attributes or {})}
 
 
 def sample(table: Table, files: list, options: ProfileOptions) -> Iterator[Sampled]:
-    pending: dict[str, list[list[dict]]] = {}  # dict batches per file, denested at the end
-    metas = {f.path: file_meta(f) for f in files}
-    for f in files:
-        rows = 0
-        for stream in open_streams(Path(f.local_path), f.member):
-            with stream:
-                for batch in table.reader.read(stream, column_types="string"):
-                    room = options.max_rows - rows
-                    if isinstance(batch, pa.Table):
-                        yield type_table(table.name, f.path, batch.slice(0, room), options, meta=metas[f.path])
-                    else:
-                        pending.setdefault(f.path, []).append(batch[:room])
-                    rows += len(batch)
-                    if rows >= options.max_rows:
-                        break
-            if rows >= options.max_rows:
-                break
-    if pending:
-        for s in denest(table, pending, options):
-            s.meta = metas[s.file]
-            yield s
+    with Denester(table) as denester:
+        for row in files:
+            file = FileInfo.of(row)
+            dicts: list[list[dict]] = []
+            for batch in read_rows(table, row, options.max_rows):
+                if isinstance(batch, pa.Table):
+                    yield type_table(table.name, file, batch, options)
+                else:
+                    dicts.append(batch)
+            if dicts:
+                yield from denester.run(file, dicts, options)
+
+
+def read_rows(table: Table, row, max_rows: int | None) -> Iterator[pa.Table | list[dict]]:
+    """Batches of one landed file through the table's reader (CSV all text), cut at max_rows."""
+    rows = 0
+    for stream in open_streams(Path(row.local_path), row.member):
+        with stream:
+            for batch in table.reader.read(stream, column_types="string"):
+                if max_rows is not None:
+                    room = max_rows - rows
+                    batch = batch.slice(0, room) if isinstance(batch, pa.Table) else batch[:room]
+                rows += len(batch)
+                yield batch
+                if max_rows is not None and rows >= max_rows:
+                    return
 
 
 def type_table(
     name: str,
-    file: str,
+    file: FileInfo,
     batch: pa.Table,
     options: ProfileOptions,
     parent: str | None = None,
     json_columns: frozenset[str] = frozenset(),  # nested values dlt kept as json text (max_nesting)
-    meta: dict | None = None,
 ) -> Sampled:
-    out = Sampled(name, file, batch, parent=parent, meta=meta or {})
+    out = Sampled(name, file, batch, parent=parent)
     for i, column in enumerate(batch.column_names):
         values = batch[column]
-        if column in json_columns:
-            typed, evidence = values, {"kind": "json"}
-        elif pa.types.is_string(values.type) or pa.types.is_large_string(values.type):
-            typed, evidence = type_strings(values, options)
-        elif options.decimals and pa.types.is_floating(values.type):
-            typed, evidence = type_doubles(values, options)
-        else:
-            continue
-        if evidence is None:
-            continue
-        if not pa.types.is_floating(values.type):
-            raw = values.combine_chunks()
-            out.raw[column] = raw if pa.types.is_string(raw.type) else pc.cast(raw, pa.string())
-        out.evidence[column] = evidence
-        out.batch = out.batch.set_column(i, column, typed)
+        array, typed = type_column(column, values, options, column in json_columns)
+        out.typed[column] = typed
+        if array is not values:
+            out.batch = out.batch.set_column(i, column, array)
     return out
 
 
-def type_strings(values: pa.ChunkedArray | pa.Array, options: ProfileOptions) -> tuple[pa.Array, dict]:
+def type_column(name: str, values: pa.ChunkedArray, options: ProfileOptions, json: bool) -> tuple[pa.Array, Typed]:
+    """Text is typed by the pass below; everything else keeps the file's type (doubles get a second look for
+    decimal literals when asked). The values as text are computed here, once, for every later statistic."""
+    if pa.types.is_nested(values.type):
+        return values, Typed("json", declared=Column.from_arrow(name, values.type))
+    if json:
+        return values, Typed("json", text=flat(values))
+    if pa.types.is_string(values.type) or pa.types.is_large_string(values.type):
+        text = flat(values)
+        array, typed = type_strings(text, options)
+        return array, replace(typed, text=text)
+    text = pc.cast(flat(values), pa.string())
+    if options.decimals and pa.types.is_floating(values.type):
+        # JSON numbers arrive as double; their shortest repr recovers the scale of decimal literals
+        _, typed = type_strings(text, options)
+        if typed.kind == "decimal":
+            return values, replace(typed, text=text)
+    declared = Column.from_arrow(name, values.type)
+    return values, Typed(declared.data_type, text=text, declared=declared)
+
+
+def type_strings(s: pa.Array, options: ProfileOptions) -> tuple[pa.Array, Typed]:
     """Vectorised typing of a text column: int, decimal, double, bool, date, timestamp or text, with the
-    evidence the proposal needs (leading zeros, digits, format, timezone)."""
-    s = values.combine_chunks() if isinstance(values, pa.ChunkedArray) else values
-    if pa.types.is_large_string(s.type):
-        s = pc.cast(s, pa.string())
+    evidence the proposal needs (leading zeros, digits, format, timezone). Numbers with a fraction become
+    double here; decimal(p, s) is a proposal decision made from the digits."""
     v = s.drop_null()
     if len(v) == 0:
-        return s, {"kind": None}
+        return s, Typed(None)
 
     def every(pattern: str) -> bool:
         return pc.all(pc.match_substring_regex(v, pattern)).as_py()
@@ -123,76 +133,80 @@ def type_strings(values: pa.ChunkedArray | pa.Array, options: ProfileOptions) ->
         parsed = pc.strptime(s, format=fmt, unit="us", error_is_null=True)
         if parsed.null_count == s.null_count:
             if all_midnight(parsed):
-                return pc.cast(parsed, pa.date32()), {"kind": "date", "format": fmt}
-            return parsed, {"kind": "timestamp", "format": fmt, "timezone": False}
+                return pc.cast(parsed, pa.date32()), Typed("date", format=fmt)
+            return parsed, Typed("timestamp", format=fmt, timezone=False)
     if every(INT):
         if pc.any(pc.match_substring_regex(v, LEADING_ZEROS)).as_py():
-            return s, {"kind": "text", "reason": "leading zeros"}
+            return s, Typed("text", reason="leading zeros")
         try:
-            return pc.cast(s, pa.int64()), {"kind": "bigint"}
+            return pc.cast(s, pa.int64()), Typed("bigint")
         except pa.ArrowInvalid:
-            return s, {"kind": "text", "reason": "integers beyond 64 bit"}
+            return s, Typed("text", reason="integers beyond 64 bit")
     if every(NUMBER):  # at least one value has a fraction, the others are integers
         int_digits = pc.max(pc.utf8_length(pc.struct_field(pc.extract_regex(v, INT_PART), "i"))).as_py()
         frac_digits = pc.max(pc.utf8_length(pc.struct_field(pc.extract_regex(v, FRAC_PART), "f"))).as_py()
-        evidence = {"kind": "decimal", "int_digits": int_digits, "frac_digits": frac_digits}
-        if options.decimals:
-            return pc.cast(s, pa.decimal128(min(38, int_digits + frac_digits), frac_digits)), evidence
-        return pc.cast(s, pa.float64()), evidence
+        return pc.cast(s, pa.float64()), Typed("decimal", int_digits=int_digits, frac_digits=frac_digits)
     if every(THOUSANDS):
-        return s, {"kind": "text", "reason": "thousands separators"}
+        return s, Typed("text", reason="thousands separators")
     if every(FLOAT):
-        return pc.cast(s, pa.float64()), {"kind": "double"}
+        return pc.cast(s, pa.float64()), Typed("double")
     if pc.all(pc.is_in(pc.utf8_lower(v), value_set=BOOLS)).as_py():
-        return pc.cast(pc.utf8_lower(s), pa.bool_()), {"kind": "bool"}
+        return pc.cast(pc.utf8_lower(s), pa.bool_()), Typed("bool")
     try:
-        return pc.cast(s, pa.date32()), {"kind": "date"}
+        return pc.cast(s, pa.date32()), Typed("date")
     except pa.ArrowInvalid:
         pass
     zoned = every(TZ_SUFFIX)
     try:
         if zoned:
-            return pc.cast(s, pa.timestamp("us", "UTC")), {"kind": "timestamp", "timezone": True}
-        return pc.cast(s, pa.timestamp("us")), {"kind": "timestamp", "timezone": False}
+            return pc.cast(s, pa.timestamp("us", "UTC")), Typed("timestamp", timezone=True)
+        return pc.cast(s, pa.timestamp("us")), Typed("timestamp", timezone=False)
     except pa.ArrowInvalid:
         pass
     try:  # some values carry an offset, some do not: naive ones are taken as UTC
-        return pc.cast(s, pa.timestamp("us", "UTC")), {"kind": "timestamp", "timezone": True}
+        return pc.cast(s, pa.timestamp("us", "UTC")), Typed("timestamp", timezone=True)
     except pa.ArrowInvalid:
-        return s, {"kind": "text"}
+        return s, Typed("text")
 
 
-def type_doubles(values: pa.ChunkedArray, options: ProfileOptions) -> tuple[pa.Array, dict | None]:
-    """JSON numbers arrive as double; their shortest repr recovers the scale of decimal literals."""
-    typed, evidence = type_strings(pc.cast(values, pa.string()), options)
-    return (typed, evidence) if evidence.get("kind") == "decimal" else (values, None)
+class Denester:
+    """One dlt pipeline into a temporary parquet destination; every file is one run and every table it
+    produces (the parent and <table>__<field> children) is typed like an arrow batch."""
 
+    def __init__(self, table: Table) -> None:
+        self.table = table
+        self.pipeline = None
 
-def denest(table: Table, pending: dict[str, list[list[dict]]], options: ProfileOptions) -> Iterator[Sampled]:
-    """One dlt run per file into a temporary parquet destination; every produced table is sampled."""
-    import dlt
+    def __enter__(self) -> Denester:
+        self._tmp = tempfile.TemporaryDirectory(prefix="profile_")
+        return self
 
-    nesting = getattr(table.writer, "max_nesting", None)
-    with tempfile.TemporaryDirectory(prefix="profile_") as tmp:
-        pipeline = dlt.pipeline(
-            pipeline_name=f"profile_{table.name}",
-            pipelines_dir=f"{tmp}/work",
-            destination=dlt.destinations.filesystem(bucket_url=f"file://{tmp}/out"),
-            dataset_name="profile",
-        )
-        for file, batches in pending.items():
-            resource = dlt.resource(batches, name=table.name, max_table_nesting=nesting)
-            info = pipeline.run(resource, loader_file_format="parquet")
-            info.raise_on_failed_jobs()
-            load_id = info.loads_ids[-1]
-            for name in pipeline.default_schema.data_table_names():
-                spec = pipeline.default_schema.tables[name]
-                columns = spec.get("columns", {})
-                json_columns = frozenset(c for c in columns if columns[c].get("data_type") == "json")
-                for path in sorted(Path(f"{tmp}/out/profile/{name}").glob(f"{load_id}.*.parquet")):
-                    batch = pq.read_table(path)
-                    batch = batch.drop_columns([c for c in batch.column_names if c.startswith("_dlt_")])
-                    yield type_table(name, file, batch, options, spec.get("parent"), json_columns)
+    def __exit__(self, *exc) -> None:
+        self._tmp.cleanup()
+
+    def run(self, file: FileInfo, batches: list[list[dict]], options: ProfileOptions) -> Iterator[Sampled]:
+        tmp = self._tmp.name
+        if self.pipeline is None:
+            self.pipeline = dlt.pipeline(
+                pipeline_name=f"profile_{self.table.name}",
+                pipelines_dir=f"{tmp}/work",
+                destination=dlt.destinations.filesystem(bucket_url=f"file://{tmp}/out"),
+                dataset_name="profile",
+            )
+        nesting = getattr(self.table.writer, "max_nesting", None)
+        resource = dlt.resource(batches, name=self.table.name, max_table_nesting=nesting)
+        info = self.pipeline.run(resource, loader_file_format="parquet")
+        info.raise_on_failed_jobs()
+        load_id = info.loads_ids[-1]
+        schema = self.pipeline.default_schema
+        for name in schema.data_table_names():
+            spec = schema.tables[name]
+            columns = spec.get("columns", {})
+            json_columns = frozenset(c for c in columns if columns[c].get("data_type") == "json")
+            for path in sorted(Path(f"{tmp}/out/profile/{name}").glob(f"{load_id}.*.parquet")):
+                batch = pq.read_table(path)
+                batch = batch.drop_columns([c for c in batch.column_names if c.startswith("_dlt_")])
+                yield type_table(name, file, batch, options, spec.get("parent"), json_columns)
 
 
 def sniff_csv(stream, reader: CsvReader) -> dict:

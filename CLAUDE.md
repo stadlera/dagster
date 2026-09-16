@@ -25,9 +25,13 @@ Read README.md first: "Stages and layout", "Semantics worth knowing", "Provider 
 - sqlite locally, SQL Server in production: no dialect-specific SQL in the manifest; dlt handles the sink.
 - Nothing generated is committed: `landing/`, `*.db`, dlt work dirs. Committed schemas and profile reports
   live in `datasets/<name>/schemas/import/` and `schemas/profile/` and are written only by `ingest.profile`.
-- Profiling is `profiling/`: `sample.py` (files -> typed arrow batches, one path per format), `stats.py`
-  (accumulators, no decisions), `propose.py` (statistics -> dlt column, every rule reads options). `schema.py`
-  is committed-schema io only. A new heuristic is a stat in `stats.py` plus a rule in `propose.py` plus a test.
+- Profiling is `profiling/`: `model.py` (shared value types: `Column`, `Typed`, `FileInfo`, `ProfileOptions`),
+  `sample.py` (files -> typed arrow batches, one path per format, one file at a time), `stats.py` (statistics
+  as values: `XStats.of(array)` merged with `+`, no decisions), `keys.py` (file and business keys), `propose.py`
+  (statistics -> `Column`, an ordered rule table, every rule reads options). `schema.py` is committed-schema io
+  only. A new heuristic is a stat in `stats.py` plus a rule in `propose.py` plus a test. Pass typed objects
+  between the stages, not dicts; the report dict is built only in `to_dict` methods. The default run reads every
+  file and row, so nothing may retain rows across files (the first file is the one exception, for key candidates).
 
 ## When changing behaviour
 

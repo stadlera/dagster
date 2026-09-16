@@ -10,8 +10,10 @@ import pyarrow.parquet
 import yaml
 
 from conftest import deeper
-from ingest.profiling import ProfileOptions, load_report, profile, write_report, write_schema
+from ingest.profiling import ProfileOptions, load_report, profile, summary, write_report, write_schema
+from ingest.profiling.model import Typed
 from ingest.profiling.sample import sniff_csv
+from ingest.profiling.stats import NumericStats
 from ingest.readers import CsvReader, JsonReader, ParquetReader
 from ingest.sources import Patterns
 from ingest.writers import DltWriter, Upsert
@@ -94,7 +96,7 @@ def test_custom_date_formats_become_dates_or_timestamps_and_the_reader_loads_the
     cols = columns(result)
     assert cols["d"] == {"nullable": True, "data_type": "date"}
     assert cols["t"] == {"nullable": True, "data_type": "timestamp", "timezone": False}
-    assert result.report["tables"]["em"]["columns"]["d"]["date_formats"] == ["%Y%m%d"]
+    assert result.report["tables"]["em"]["columns"]["d"]["temporal"]["formats"] == ["%Y%m%d"]
     write_schema(result.schema, dataset)
     ws.load(table, date(2026, 9, 10))
     assert ws.query("select d, t from em order by d") == [
@@ -185,7 +187,7 @@ def test_categorical_domain_and_candidate_keys_are_recorded(ws):
     assert "categorical" not in cols["seq"]  # 5 distinct > categorical_max
     assert cols["isin"]["unique_in_file"] is True and cols["isin"]["unique"] is False  # key per day, not overall
     assert cols["seq"]["unique"] is True and cols["seq"]["distinct"] == 5
-    assert cols["ccy"]["files"] == "2/2" and list(result.report["tables"]["em"]["files"].values()) == [3, 2]
+    assert cols["ccy"]["files"] == 2 and list(result.report["tables"]["em"]["files"].values()) == [3, 2]
 
 
 def test_json_is_denested_like_the_load_and_child_tables_are_profiled(ws):
@@ -294,6 +296,50 @@ def test_file_keys_business_keys_churn_and_volume_are_derived_from_the_sample(ws
     assert result.report["tables"]["em"]["suggested"]["merge"] == "Upsert"
 
 
+def test_every_row_of_every_file_is_profiled_unless_max_rows_cuts_each_file(ws):
+    csv = b"n\n1\n2\n3\n"
+    result, *_ = profiled(ws, {"em-2026-09-10.csv": csv, "em-2026-09-11.csv": csv})
+    assert result.report["tables"]["em"]["rows"] == 6 and result.report["options"]["max_rows"] is None
+    result, *_ = profiled(ws, {"em-2026-09-12.csv": csv, "em-2026-09-13.csv": csv}, options=ProfileOptions(max_rows=2))
+    assert list(result.report["tables"]["em"]["files"].values()) == [2, 2]
+
+
+def test_distinct_counts_stop_at_distinct_max_while_keys_are_still_verified_per_file(ws):
+    day1, day2 = b"id,px\n1,1.0\n2,1.0\n3,1.0\n", b"id,px\n4,1.0\n5,1.0\n6,1.0\n"
+    result, *_ = profiled(
+        ws, {"em-2026-09-10.csv": day1, "em-2026-09-11.csv": day2}, options=ProfileOptions(distinct_max=4)
+    )
+    em = result.report["tables"]["em"]
+    assert em["columns"]["id"]["distinct"] is None and em["columns"]["id"]["distinct_over"] == 4
+    assert em["columns"]["id"]["unique"] is None and em["columns"]["id"]["unique_in_file"] is True
+    assert em["columns"]["px"]["distinct"] == 1 and em["columns"]["px"]["unique_in_file"] is False
+    [key] = em["keys"]["candidates"]
+    assert key["columns"] == ["id"] and key["repeat_ratio"] is None and key["unique_overall"] is None
+    assert em["suggested"] == {"merge": None, "keys": ["id"], "note": "recurrence across files unknown"}
+
+
+def test_composite_keys_are_chosen_on_the_first_file_and_dropped_when_a_later_file_breaks_them(ws):
+    day1 = b"isin,leg,px\nXS1,A,1.0\nXS1,B,1.1\nXS2,A,2.0\n"
+    day2 = b"isin,leg,px\nXS1,A,1.0\nXS1,A,1.2\n"  # the pair repeats
+    result, *_ = profiled(ws, {"em-2026-09-10.csv": day1, "em-2026-09-11.csv": day2})
+    em = result.report["tables"]["em"]
+    assert em["keys"]["candidate_columns"] == ["isin", "leg"] and em["keys"]["candidates"] == []
+    assert em["suggested"]["merge"] == "ReplaceDay" and em["suggested"]["keys"] is None
+    result, *_ = profiled(ws, {"em-2026-09-12.csv": day1}, options=ProfileOptions(composite_keys=False))
+    assert result.report["tables"]["em"]["keys"]["candidates"] == []
+
+
+def test_numeric_sample_stays_bounded_and_deterministic_when_batches_merge():
+    a = NumericStats.of(pa.array(range(100), pa.int64()), Typed("bigint"), size=10)
+    b = NumericStats.of(pa.array([-1.0, 0.0, float("nan")], pa.float64()), Typed("double"), size=10)
+    merged = a + b
+    assert len(a.sample) == 10 and a.seen == 100 and len(merged.sample) == 10 and merged.seen == 102
+    assert (merged.min, merged.max, merged.zeros, merged.negatives) == (-1.0, 99, 2, 1)
+    assert (a + b).sample.tolist() == merged.sample.tolist()
+    assert sum(merged.to_dict()["histogram"]["counts"]) == 10
+    assert NumericStats.of(pa.array([float("nan")]), Typed("double"), size=10) is None
+
+
 def test_files_sharing_a_business_date_need_their_attribute_in_the_file_key(ws):
     ws.write_remote("em-2026-09-10.csv", b"isin,px\nXS1,1\nXS2,2\n")
     ws.write_remote("apac/em-2026-09-10.csv", b"isin,px\nXS1,3\nXS2,4\n")
@@ -308,3 +354,13 @@ def test_files_sharing_a_business_date_need_their_attribute_in_the_file_key(ws):
     # px is unique too but never recurs: the recurring key comes first and drives the suggestion
     assert [c["columns"] for c in em["keys"]["candidates"]] == [["isin"], ["px"]]
     assert em["suggested"] == {"merge": "Upsert", "keys": ["isin"], "note": "100% of key values recur"}
+
+
+def test_a_surrogate_id_does_not_hide_the_composite_business_key(ws):
+    day1 = b"row,isin,leg,px\n1,XS1,A,1.0\n2,XS1,B,1.1\n3,XS2,A,2.0\n"
+    day2 = b"row,isin,leg,px\n4,XS1,A,1.0\n5,XS2,A,2.1\n6,XS3,A,3.0\n"
+    result, *_ = profiled(ws, {"em-2026-09-10.csv": day1, "em-2026-09-11.csv": day2})
+    em = result.report["tables"]["em"]
+    assert [c["columns"] for c in em["keys"]["candidates"]] == [["isin", "leg"], ["row"]]
+    assert em["suggested"]["merge"] == "Upsert" and em["suggested"]["keys"] == ["isin", "leg"]
+    assert "key isin+leg: 50% of values recur" in summary(result)

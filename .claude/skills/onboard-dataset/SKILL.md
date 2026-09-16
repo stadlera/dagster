@@ -42,7 +42,8 @@ Use the README "Provider patterns" table row by row. Rules of thumb:
 3. Add tables, materialize `raw/<feed>` again (classifies the mirrored files), check that
    `classified` in the asset metadata matches expectations and no `AmbiguousMatch` occurred.
 4. `uv run python -m ingest.profile <feed>/<table>` with the opt-ins the provider needs (`--decimals`,
-   `--narrow`, `--date-format`). Read the printed summary and the report's `hints` (csv dialect), `flags`
+   `--narrow`, `--date-format`); `--skim` while iterating on the reader, the full run before committing.
+   Read the printed summary and the report's `hints` (csv dialect), `flags`
    (quirks) and `unique_in_file` (candidate `Upsert` keys); fix the `CsvReader` and rerun if the dialect
    disagreed. Review the YAML (widen decimals, fixed lengths that are a coincidence of the sample), commit
    the YAML and the profile report.

@@ -4,12 +4,13 @@
     write_schema(profile.schema, dataset); write_report(profile, dataset, table)
     load_report(dataset, table) -> dict          # for tests, docs, derived checks
 
-sample.py turns files into typed arrow batches, stats.py accumulates per-column statistics and quirks,
-propose.py maps them to dlt columns and suggests a merge strategy.
+model.py holds the shared value types, sample.py turns files into typed arrow batches, stats.py
+accumulates per-column statistics and quirks, keys.py finds file and business keys, propose.py maps the
+statistics to dlt columns and suggests a merge strategy.
 
-Report contract (REPORT_VERSION): files are identified by manifest path, never by id. Numbers are JSON
-numbers for bigint and double; decimal, date and timestamp values are exact strings, so read them with
-the column's `proposed.data_type`. Every statistic is addressable by a plain path, e.g.
+Report contract (REPORT_VERSION): files are identified by manifest path, never by id. Numeric statistics
+are JSON numbers (doubles, also for decimal columns); date and timestamp values are ISO strings. Every
+statistic is addressable by a plain path, e.g.
 `tables.<table>.volume.rows_per_file.min`, `tables.<table>.keys.candidates[0].columns`,
 `tables.<table>.columns.<column>.numeric.max`.
 """
@@ -24,15 +25,16 @@ from typing import TYPE_CHECKING
 from dlt.common.schema import Schema
 from dlt.common.schema.utils import new_table
 
-from ingest.profiling.propose import ProfileOptions, propose_column, suggest_merge
-from ingest.profiling.sample import file_meta, sample, sniff_files
+from ingest.profiling.model import Column, ProfileOptions
+from ingest.profiling.propose import propose_column, suggest_merge
+from ingest.profiling.sample import FileInfo, sample, sniff_files
 from ingest.profiling.stats import TableProfile
 from ingest.schema import committed_schema, report_path, write_schema
 
 if TYPE_CHECKING:
     from ingest.config import Dataset, Table
 
-__all__ = ["Profile", "ProfileOptions", "load_report", "profile", "summary", "write_report", "write_schema"]
+__all__ = ["Column", "Profile", "ProfileOptions", "load_report", "profile", "summary", "write_report", "write_schema"]
 
 REPORT_VERSION = 1
 
@@ -50,40 +52,24 @@ def profile(dataset: Dataset, table: Table, files: list, options: ProfileOptions
         options = replace(options, keys=tuple(keys))
     tables: dict[str, TableProfile] = {}
     for s in sample(table, files, options):
-        tp = tables.setdefault(
-            s.table,
-            TableProfile(
-                s.table,
-                s.parent,
-                options.reservoir,
-                options.categorical_max,
-                options.composite_keys,
-                options.key_columns_max,
-            ),
-        )
-        tp.add(s.batch, s.file, s.evidence, s.raw, s.meta)
+        tables.setdefault(s.table, TableProfile(s.table, s.parent, options)).add(s)
     schema = committed_schema(dataset) or Schema(dataset.schema_name)
     if stale := [name for name in tables if name in schema.tables]:
         schema.drop_tables(stale)
     report_tables = {}
     for name, tp in tables.items():
-        columns = {col: propose_column(col, p, options) for col, p in tp.columns.items()}
-        schema.update_table(new_table(name, parent_table_name=tp.parent, columns=list(columns.values())))
+        columns = {col: propose_column(p, options) for col, p in tp.columns.items()}
+        schema.update_table(new_table(name, parent_table_name=tp.parent, columns=[c.dlt() for c in columns.values()]))
         data = tp.to_dict(columns)
         if tp.parent is None:
-            data["suggested"] = suggest_merge(data["keys"], len(tp.files), options.key_repeat_threshold)
+            data["suggested"] = asdict(suggest_merge(data["keys"], len(tp.files), options.key_repeat_threshold))
         report_tables[name] = data
     sniffed = sniff_files(table, files)
     report = {
         "version": REPORT_VERSION,
         "table": table.name,
         "options": asdict(options),
-        "files": [
-            {"path": f.path, "size": f.size}
-            | {k: str(v) if k == "business_date" else v for k, v in file_meta(f).items()}
-            | ({"csv": sniffed[f.id]} if f.id in sniffed else {})
-            for f in files
-        ],
+        "files": [FileInfo.of(f).to_dict() | ({"csv": sniffed[f.id]} if f.id in sniffed else {}) for f in files],
         "tables": report_tables,
     }
     return Profile(schema, report)
@@ -106,8 +92,12 @@ def summary(profile: Profile) -> str:
     for name, tp in profile.report["tables"].items():
         vol = tp["volume"]["rows_per_file"]
         lines.append(f"{name}: {tp['rows']} rows, {len(tp['files'])} files, {vol['min']}..{vol['max']} rows per file")
+        for key in tp["keys"]["candidates"]:
+            ratio = key["repeat_ratio"]
+            recur = f"{ratio:.0%} of values recur" if ratio is not None else "recurrence unknown"
+            lines.append(f"  key {'+'.join(key['columns'])}: {recur}")
         if suggested := tp.get("suggested"):
-            lines.append(f"  keys: {suggested['keys']} -> {suggested['merge']} ({suggested['note']})")
+            lines.append(f"  suggested: {suggested['merge']} on {suggested['keys']} ({suggested['note']})")
         for col, data in tp["columns"].items():
             p = data["proposed"]
             size = ",".join(str(p[k]) for k in ("precision", "scale") if k in p)

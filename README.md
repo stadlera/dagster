@@ -20,11 +20,12 @@ One table goes through five stages; each stage is configured by one object on th
       config.py            Feed / Table / Dataset and the asset key properties
       resources.py         Remote (any fsspec filesystem), Landing, Manifest (storage only), Sql
       schema.py            committed schema io: readers read with its types
-      profiling/           sample.py (typed batches per format, csv sniff), stats.py (per-column statistics),
-                           propose.py (statistics -> dlt columns); profile() returns schema + report
+      profiling/           model.py (Column, Typed, FileInfo, ProfileOptions), sample.py (typed batches per
+                           format, csv sniff), stats.py (per-column statistics), keys.py (file and business
+                           keys), propose.py (statistics -> dlt columns); profile() returns schema + report
       factory.py           Dataset -> assets, checks, sync schedule, load sensor
       definitions.py       Dagster entry point: shared resources + all discovered datasets
-      profile.py           CLI: uv run python -m ingest.profile <feed>/<table> [--decimals --narrow ...]
+      profile.py           CLI: uv run python -m ingest.profile <feed>/<table> [--skim --decimals --narrow ...]
       alerting.py          Notifier resource, run-failure and run-findings (checks, schema changes) sensors
       ops.py               operator helpers: reload / ignore / reclassify (also a CLI)
       datasets/<name>/     `dataset = Dataset(...)`, custom Dagster objects, schemas/import/<feed>.schema.yaml,
@@ -77,13 +78,16 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
 ## Schema workflow
 
 1. Run the raw asset so files are landed and classified.
-2. `uv run python -m ingest.profile acme/prices` samples recent files, proposes the table's columns into
+2. `uv run python -m ingest.profile acme/prices` reads every classified file (`--skim`: the 5 most recent
+   files, 200k rows each; `--files N --rows N` for anything in between), proposes the table's columns into
    `datasets/acme/schemas/import/acme.schema.yaml` (other tables in the file are kept) and writes the
    evidence to `datasets/acme/schemas/profile/acme.prices.profile.json`. Both are committed.
-   - Files are sampled the way a load sees them. CSV is read as text and typed with arrow kernels
-     (bigint, double, bool, date, timestamp; leading zeros or thousands separators keep a column text).
-     Parquet keeps its types. JSON, Avro and other dict readers are denested by dlt with the table's
-     `max_nesting`, so child tables `<table>__<field>` are profiled and committed too.
+   - Files are sampled the way a load sees them, one file at a time. CSV is read as text and typed with
+     arrow kernels (bigint, double, bool, date, timestamp; leading zeros or thousands separators keep a
+     column text). Parquet keeps its types. JSON, Avro and other dict readers are denested by dlt with the
+     table's `max_nesting`, so child tables `<table>__<field>` are profiled and committed too. Memory is
+     bounded per column (a value sample for histograms, capped value counts, distinct values up to
+     `distinct_max`, default one million; beyond it `distinct` and `unique` are reported as null).
    - Opt-ins: `--decimals` (decimal(p,s) with two integer digits of headroom instead of double), `--narrow`
      (int / smallint when the value range x10 fits), `--strict-nulls` (NOT NULL for columns without nulls in
      the sample; `Upsert` keys are always NOT NULL), `--date-format %Y%m%d` (repeatable; the reader needs
@@ -97,15 +101,18 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
      file a dialect sniff (delimiter, quoting, line endings, ragged rows) with hints when the file
      disagrees with the declared `CsvReader`.
    - Per table: `volume` (rows per file, files and rows per business date) and `keys`: column sets that
-     are unique within every file (single columns, else pairs, else triples), whether they are unique
-     across the sample, the share of key values that recur in later files (`repeat_ratio`) and the churn
-     between consecutive files (new / dropped key values). `file_key_metadata` lists `_business_date`
-     plus every pattern attribute that varies between files of one date. `suggested` turns this into
+     are unique within every file, whether they are unique across the sample, the share of key values
+     that recur in later files (`repeat_ratio`) and the churn between consecutive files (new / dropped
+     key values). Every column is followed on its own; pairs (else triples) of the highest-cardinality
+     columns that are not unique on their own but unique together within the first file are chosen there
+     and verified on every later file. Every surviving key set is reported, most recurring first; which
+     one is the business key is a review decision. `file_key_metadata` lists `_business_date` plus every
+     pattern attribute that varies between files of one date. `suggested` turns the first key set into
      `Upsert(keys)` when values recur (default: at least half) or `ReplaceDay` otherwise; it is a hint,
      the writer stays your declaration.
-   - Report contract: `version`, files identified by manifest path (never id), JSON numbers for bigint
-     and double, exact strings for decimal / date / timestamp (parse with the column's
-     `proposed.data_type`). `ingest.profiling.load_report(dataset, table)` reads it back, e.g. for a
+   - Report contract: `version`, files identified by manifest path (never id), numeric statistics as
+     JSON numbers (doubles, also for decimal columns), dates and timestamps as ISO strings.
+     `ingest.profiling.load_report(dataset, table)` reads it back, e.g. for a
      scenario test asserting `tables.em.volume.rows_per_file.min` or a range check derived from
      `tables.em.columns.price.numeric`.
 3. Review the YAML (widen decimals, drop a fixed length that is a coincidence of the sample, drop `description`
