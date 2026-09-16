@@ -10,18 +10,15 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from ingest.profiling.arrow import all_midnight, flat, fraction_digits
-from ingest.profiling.keys import KeyTracker
-from ingest.profiling.model import NUMERIC, TEMPORAL, Column, FileInfo, ProfileOptions, Typed
-
-if TYPE_CHECKING:
-    from ingest.profiling.sample import Sampled
+from ingest_tools.profiling.kernel.arrow import all_midnight, flat, fraction_digits
+from ingest_tools.profiling.kernel.keys import KeyTracker
+from ingest_tools.profiling.kernel.model import NUMERIC, TEMPORAL, Column, FileInfo, ProfileOptions, Sampled, Typed
 
 # value quirks worth knowing before a load: counted per column, never changing the proposed type
 QUIRKS = {

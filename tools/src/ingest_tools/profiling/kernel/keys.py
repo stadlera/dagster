@@ -11,15 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import combinations
-from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from ingest.profiling.model import KEYABLE, ProfileOptions
-
-if TYPE_CHECKING:
-    from ingest.profiling.sample import Sampled
+from ingest_tools.profiling.kernel.model import KEYABLE, ProfileOptions, Sampled
 
 SEPARATOR = "\x1f"
 COMPACT_EVERY = 32  # unique chunks kept before they are merged

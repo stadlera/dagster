@@ -25,11 +25,11 @@ from typing import TYPE_CHECKING
 from dlt.common.schema import Schema
 from dlt.common.schema.utils import new_table
 
-from ingest.profiling.model import Column, ProfileOptions
-from ingest.profiling.propose import propose_column, suggest_merge
-from ingest.profiling.sample import FileInfo, sample, sniff_files
-from ingest.profiling.stats import TableProfile
-from ingest.schema import committed_schema, report_path, write_schema
+from ingest.schema import committed_schema, schema_path
+from ingest_tools.profiling.kernel.model import Column, ProfileOptions
+from ingest_tools.profiling.kernel.propose import propose_column, suggest_merge
+from ingest_tools.profiling.kernel.stats import TableProfile
+from ingest_tools.profiling.sample import FileInfo, sample, sniff_files
 
 if TYPE_CHECKING:
     from ingest.config import Dataset, Table
@@ -84,6 +84,17 @@ def write_report(profile: Profile, dataset: Dataset, table: Table) -> Path:
 
 def load_report(dataset: Dataset, table: Table) -> dict:
     return json.loads(report_path(dataset, table).read_text())
+
+
+def report_path(dataset: Dataset, table: Table) -> Path:
+    return dataset.schema_dir / "profile" / f"{dataset.schema_name}.{table.name}.profile.json"
+
+
+def write_schema(schema: Schema, dataset: Dataset) -> Path:
+    path = schema_path(dataset)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(schema.to_pretty_yaml())
+    return path
 
 
 def summary(profile: Profile) -> str:

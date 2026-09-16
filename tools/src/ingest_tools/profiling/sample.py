@@ -9,7 +9,7 @@ import csv
 import io
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
@@ -19,13 +19,13 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from ingest.archives import open_streams
-from ingest.profiling.arrow import all_midnight, flat
-from ingest.profiling.model import Column, FileInfo, Typed
 from ingest.readers import CsvReader
+from ingest_tools.profiling.kernel.arrow import all_midnight, flat
+from ingest_tools.profiling.kernel.model import Column, FileInfo, Sampled, Typed
 
 if TYPE_CHECKING:
     from ingest.config import Table
-    from ingest.profiling.model import ProfileOptions
+    from ingest_tools.profiling.kernel.model import ProfileOptions
 
 INT = r"^-?\d+$"
 LEADING_ZEROS = r"^-?0\d"
@@ -37,17 +37,6 @@ FLOAT = r"^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$"
 TZ_SUFFIX = r"(Z|[+-]\d{2}:?\d{2})$"
 BOOLS = pa.array(["true", "false"])
 SNIFF_BYTES = 1 << 18
-
-
-@dataclass
-class Sampled:
-    """One typed batch of one table (after denesting) from one file."""
-
-    table: str  # table name after denesting (parent or <table>__<field>)
-    file: FileInfo
-    batch: pa.Table
-    typed: dict[str, Typed] = field(default_factory=dict)  # every column of the batch
-    parent: str | None = None
 
 
 def sample(table: Table, files: list, options: ProfileOptions) -> Iterator[Sampled]:

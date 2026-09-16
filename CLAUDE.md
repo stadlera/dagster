@@ -5,8 +5,9 @@ Read README.md first: "Stages and layout", "Semantics worth knowing", "Provider 
 
 ## Commands
 
-    uv run pytest -q                              # ~60 tests, < 10 s, sqlite + temp dirs, no network
-    uvx ruff check --fix src tests && uvx ruff format src tests
+    uv run --package ingest pytest -q             # Dagster user-code runtime tests
+    uv run --package ingest-tools pytest -q tools/tests  # discovery, profiling, ops and compatibility tests
+    uvx ruff check --fix src tests tools/src tools/tests && uvx ruff format src tests tools/src tools/tests
     uv run dagster definitions validate           # after touching config/factory/datasets
     uv run dagster dev                            # demo dataset in src/ingest/datasets/tradeweb
 
@@ -14,6 +15,8 @@ Read README.md first: "Stages and layout", "Semantics worth knowing", "Provider 
 
 - One object per stage on `Table`: `source`, `checks`, `partitioning`, `reader`, `writer`. Provider
   quirks go into these objects or into `datasets/<name>/`, never into new fields on `Table` or `Feed`.
+- `ingest` is the deployable Dagster user-code distribution. `ingest-tools` contains discovery, profiling
+  and operator workflows and may depend on `ingest`; runtime code must never import `ingest_tools`.
 - Protocols (`Source`, `Check`, `Reader`, `Writer`) get a new method or a new sibling protocol only when
   a second real implementation needs it. Prefer a class implementing an existing protocol.
 - `resources.Manifest` is storage: small named queries, no decisions. Decisions live in `classify.py`,
@@ -25,8 +28,8 @@ Read README.md first: "Stages and layout", "Semantics worth knowing", "Provider 
 - sqlite locally, SQL Server in production: no dialect-specific SQL in the manifest; dlt handles the sink.
 - Nothing generated is committed: `landing/`, `*.db`, dlt work dirs. Committed schemas and profile reports
   live in `datasets/<name>/schemas/import/` and `schemas/profile/` and are written only by `ingest.profile`.
-- Profiling is `profiling/`: `model.py` (shared value types: `Column`, `Typed`, `FileInfo`, `ProfileOptions`),
-  `sample.py` (files -> typed arrow batches, one path per format, one file at a time), `stats.py` (statistics
+- Profiling is `tools/src/ingest_tools/profiling/`: `kernel/model.py` (shared value types: `Column`, `Typed`,
+  `FileInfo`, `ProfileOptions`), `sample.py` (files -> typed arrow batches, one path per format, one file at a time), `kernel/stats.py` (statistics
   as values: `XStats.of(array)` merged with `+`, no decisions), `keys.py` (file and business keys), `propose.py`
   (statistics -> `Column`, an ordered rule table, every rule reads options). `schema.py` is committed-schema io
   only. A new heuristic is a stat in `stats.py` plus a rule in `propose.py` plus a test. Pass typed objects

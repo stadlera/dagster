@@ -11,6 +11,8 @@ import sqlalchemy as sa
 from dagster import ConfigurableResource
 from pydantic import PrivateAttr
 
+from ingest.remote import coerce_option
+
 
 class Remote(ConfigurableResource):
     """Any fsspec filesystem: sftp, file, s3, ... Options are passed through to the backend
@@ -21,15 +23,7 @@ class Remote(ConfigurableResource):
     options: dict[str, str] = {}
 
     def fs(self) -> fsspec.AbstractFileSystem:
-        return fsspec.filesystem(self.protocol, **{k: _coerce(v) for k, v in self.options.items()})
-
-
-def _coerce(value: str):
-    if value.isdigit():
-        return int(value)
-    if value.lower() in ("true", "false"):
-        return value.lower() == "true"
-    return value
+        return fsspec.filesystem(self.protocol, **{k: coerce_option(v) for k, v in self.options.items()})
 
 
 class Sql(ConfigurableResource):

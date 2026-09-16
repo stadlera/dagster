@@ -3,6 +3,10 @@
 Dagster ingestion of external finance datasets: mirror provider files byte for byte into a landing
 area, track every file in a manifest, load them into SQL Server with dlt.
 
+The repository is a uv workspace with two distributions. `ingest` is the deployable Dagster user-code
+package. `ingest-tools` contains human-run discovery, profiling and manifest administration workflows and
+depends on `ingest`; runtime code never depends on tools.
+
 ## Stages and layout
 
 One table goes through five stages; each stage is configured by one object on the `Table`:
@@ -19,25 +23,28 @@ One table goes through five stages; each stage is configured by one object on th
     src/ingest/
       config.py            Feed / Table / Dataset and the asset key properties
       resources.py         Remote (any fsspec filesystem), Landing, Manifest (storage only), Sql
-      schema.py            committed schema io: readers read with its types
-      profiling/           model.py (Column, Typed, FileInfo, ProfileOptions), sample.py (typed batches per
-                           format, csv sniff), stats.py (per-column statistics), keys.py (file and business
-                           keys), propose.py (statistics -> dlt columns); profile() returns schema + report
+      schema.py            committed schema reads: runtime readers use its types
       factory.py           Dataset -> assets, checks, sync schedule, load sensor
       definitions.py       Dagster entry point: shared resources + all discovered datasets
-      profile.py           CLI: uv run python -m ingest.profile <feed>/<table> [--skim --decimals --narrow ...]
       alerting.py          Notifier resource, run-failure and run-findings (checks, schema changes) sensors
-      ops.py               operator helpers: reload / ignore / reclassify (also a CLI)
       datasets/<name>/     `dataset = Dataset(...)`, custom Dagster objects, schemas/import/<feed>.schema.yaml,
                            schemas/profile/<feed>.<table>.profile.json
+
+    tools/src/ingest_tools/
+      discover.py          remote metadata inventory and onboarding suggestions
+      profile.py           schema profiling CLI and application workflow
+      profiling/kernel/    reusable value types, statistics, key discovery and proposal rules
+      profiling/sample.py  runtime adapters: landed files and readers -> typed batches
+      ops.py               operator helpers: reload / ignore / reclassify
 
 Dagster objects per dataset: one unpartitioned `raw/<feed>` asset (mirror + classify), one partitioned
 `sql/<feed>/<table>` asset per table, asset checks, a sync schedule and a load sensor.
 
 ## Run locally
 
-    uv sync --extra sftp
+    uv sync --all-packages --extra sftp
     uv run pytest
+    uv run --package ingest-tools pytest tools/tests
     uv run dagster dev        # demo feed reads examples/remote, writes ./landing, manifest.db, warehouse*.db
 
 Environment: `INGEST_LANDING_ROOT`, `INGEST_MANIFEST_URL`, `INGEST_SQL_URL` (`mssql+pyodbc://...` in
@@ -78,7 +85,7 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
 ## Schema workflow
 
 1. Run the raw asset so files are landed and classified.
-2. `uv run python -m ingest.profile acme/prices` reads every classified file (`--skim`: the 5 most recent
+2. `uv run ingest-profile acme/prices` reads every classified file (`--skim`: the 5 most recent
    files, 200k rows each; `--files N --rows N` for anything in between), proposes the table's columns into
    `datasets/acme/schemas/import/acme.schema.yaml` (other tables in the file are kept) and writes the
    evidence to `datasets/acme/schemas/profile/acme.prices.profile.json`. Both are committed.
@@ -112,7 +119,7 @@ production; sqlite by default), plus per-feed secrets via `EnvVar` in the datase
      the writer stays your declaration.
    - Report contract: `version`, files identified by manifest path (never id), numeric statistics as
      JSON numbers (doubles, also for decimal columns), dates and timestamps as ISO strings.
-     `ingest.profiling.load_report(dataset, table)` reads it back, e.g. for a
+    `ingest_tools.profiling.load_report(dataset, table)` reads it back, e.g. for a
      scenario test asserting `tables.em.volume.rows_per_file.min` or a range check derived from
      `tables.em.columns.price.numeric`.
 3. Review the YAML (widen decimals, drop a fixed length that is a coincidence of the sample, drop `description`
@@ -196,7 +203,7 @@ limits the depth, 0 keeps nested values as json text.
   optionally `INGEST_SMTP_USER` / `INGEST_SMTP_PASSWORD` for STARTTLS login. Without a host it only
   logs. Turn the sensors on in the Dagster UI.
 - **Manual interventions**: reloading is materializing the partition or range in the UI. For the rest
-  `uv run python -m ingest.ops ...`: `reload <table> <start> [<end>]` marks a date range as not loaded
+  `uv run ingest-ops ...`: `reload <table> <start> [<end>]` marks a date range as not loaded
   so the load sensor requests it again; `ignore <id...>` takes files out of loading (ids from the
   manifest); `reclassify <table>` forgets the table's assignments so the next sync re-runs changed
   patterns.

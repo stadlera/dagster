@@ -1,9 +1,4 @@
-"""Committed schemas: one dlt schema YAML per dataset in <dataset>/schemas/import/<feed>.schema.yaml.
-
-`ingest.profiling` proposes one from landed files (run once, review, commit) and writes its evidence to
-<dataset>/schemas/profile/<feed>.<table>.profile.json. `committed_types` turns the committed columns into
-arrow types so loaders read with them instead of inferring per file.
-"""
+"""Read the committed dlt schema used by runtime loaders."""
 
 from __future__ import annotations
 
@@ -29,10 +24,6 @@ def schema_path(dataset: Dataset) -> Path:
     return dataset.schema_dir / "import" / f"{dataset.schema_name}.schema.yaml"
 
 
-def report_path(dataset: Dataset, table: Table) -> Path:
-    return dataset.schema_dir / "profile" / f"{dataset.schema_name}.{table.name}.profile.json"
-
-
 def committed_schema(dataset: Dataset) -> Schema | None:
     path = schema_path(dataset)
     return Schema.from_dict(yaml.safe_load(path.read_text())) if path.exists() else None
@@ -49,10 +40,3 @@ def committed_types(dataset: Dataset, table: Table, caps: DestinationCapabilitie
         for name, col in columns.items()
         if not name.startswith("_") and "data_type" in col
     }
-
-
-def write_schema(schema: Schema, dataset: Dataset) -> Path:
-    path = schema_path(dataset)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(schema.to_pretty_yaml())
-    return path

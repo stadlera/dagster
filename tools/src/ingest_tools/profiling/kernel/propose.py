@@ -8,10 +8,10 @@ import math
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Callable
 
-from ingest.profiling.model import Column, ProfileOptions
+from ingest_tools.profiling.kernel.model import Column, ProfileOptions
 
 if TYPE_CHECKING:
-    from ingest.profiling.stats import ColumnProfile
+    from ingest_tools.profiling.kernel.stats import ColumnProfile
 
 TEXT_BUCKETS = (20, 50, 100, 255, 1000, 4000)  # nvarchar lengths; above the last one: unbounded
 INT_WIDTHS = ((16, 2**15), (32, 2**31))  # dlt bigint precision in bits -> smallint / int on mssql

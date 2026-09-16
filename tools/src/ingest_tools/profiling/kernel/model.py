@@ -52,6 +52,17 @@ class Typed:
     timezone: bool | None = None
 
 
+@dataclass
+class Sampled:
+    """One typed batch of one table from one file."""
+
+    table: str
+    file: FileInfo
+    batch: pa.Table
+    typed: dict[str, Typed] = field(default_factory=dict)
+    parent: str | None = None
+
+
 @dataclass(frozen=True)
 class FileInfo:
     path: str  # manifest path: stable across environments, unlike the id

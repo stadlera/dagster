@@ -10,13 +10,13 @@ import pyarrow.parquet
 import yaml
 
 from conftest import deeper
-from ingest.profiling import ProfileOptions, load_report, profile, summary, write_report, write_schema
-from ingest.profiling.model import Typed
-from ingest.profiling.sample import sniff_csv
-from ingest.profiling.stats import NumericStats
 from ingest.readers import CsvReader, JsonReader, ParquetReader
 from ingest.sources import Patterns
 from ingest.writers import DltWriter, Upsert
+from ingest_tools.profiling import ProfileOptions, load_report, profile, summary, write_report, write_schema
+from ingest_tools.profiling.kernel.model import Typed
+from ingest_tools.profiling.kernel.stats import NumericStats
+from ingest_tools.profiling.sample import sniff_csv
 
 JSON = Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.json$",))
 PARQUET = Patterns((r"^EM/em-(?P<date>\d{4}-\d{2}-\d{2})\.parquet$",))

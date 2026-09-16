@@ -2,17 +2,13 @@
 
 from datetime import date
 
-import dlt
 import pytest
-import yaml
 from dlt.pipeline.exceptions import PipelineStepFailed
 
 from conftest import deeper
 from ingest.load import metadata_columns
 from ingest.partitioning import Monthly
-from ingest.profiling import ProfileOptions, profile, write_schema
 from ingest.readers import JsonReader
-from ingest.schema import committed_types
 from ingest.sources import Patterns
 from ingest.writers import DltWriter, Upsert
 
@@ -117,44 +113,3 @@ def test_schema_contract_adds_columns_but_rejects_type_changes(ws):
     with pytest.raises(PipelineStepFailed, match="price"):  # float -> text: refused, nothing written
         ws.load(table, date(2026, 9, 14))
     assert ws.query("select count(*) from px") == [(2,)]
-
-
-def test_profile_proposes_a_schema_and_loads_read_with_the_committed_types(ws):
-    ws.write_remote(
-        "em-2026-09-08.csv", b"id,isin,price,as_of,note\n00123,XS1,1.50,2026-09-08,hello\n7,XS2,12.345,2026-09-08,\n"
-    )
-    ws.sync()
-    table = ws.table()
-    ws.classify(table)
-    dataset = ws.dataset(table)
-
-    files = ws.manifest.files_for(table.key, date(2026, 9, 8))
-    proposed = profile(dataset, table, files).schema.tables["em"]["columns"]
-    assert proposed["price"]["data_type"] == "double"  # decimals are opt-in
-    path = write_schema(profile(dataset, table, files, ProfileOptions(decimals=True)).schema, dataset)
-    cols = yaml.safe_load(path.read_text())["tables"]["em"]["columns"]
-    assert path.name == "tradeweb.schema.yaml"
-    # the id has leading zeros: text, so the load keeps them
-    assert cols["id"] == {"nullable": True, "data_type": "text", "precision": 20, "description": "leading zeros"}
-    assert cols["price"] == {"nullable": True, "data_type": "decimal", "precision": 7, "scale": 3}  # 2 digits headroom
-    assert cols["as_of"]["data_type"] == "date" and cols["note"] == {
-        "nullable": True,
-        "data_type": "text",
-        "precision": 20,
-    }
-    caps = dlt.destinations.sqlalchemy(credentials="sqlite://").capabilities()
-    assert committed_types(dataset, table, caps)["id"].equals(__import__("pyarrow").string())
-    assert table.writer.column_types(dataset, table, ws.sql_url)["id"].equals(__import__("pyarrow").string())
-    ws.load(table, date(2026, 9, 8))
-    assert ws.query("select id, price from em order by id") == [("00123", 1.5), ("7", 12.345)]
-    # a column the provider added after the schema was committed is loaded and reported
-    ws.write_remote(
-        "em-2026-09-09.csv", b"id,isin,price,as_of,note,currency\n8,XS3,1.0,2026-09-09,x,EUR\n", bump_mtime=True
-    )
-    ws.sync()
-    ws.classify(table)
-    assert ws.load(table, date(2026, 9, 9)).details["new_columns"] == ["currency"]
-    # profiling another table keeps the first one in the shared dataset schema
-    other = ws.table("em2")
-    write_schema(profile(dataset, other, ws.manifest.files_for(table.key, date(2026, 9, 8))).schema, dataset)
-    assert set(yaml.safe_load(path.read_text())["tables"]) >= {"em", "em2"}

@@ -1,15 +1,15 @@
 """Operator helpers on the manifest, also as a CLI:
 
-uv run python -m ingest.ops show tradeweb/em 2026-09-08          files of one business date, with ids
-uv run python -m ingest.ops reload tradeweb/em 2026-09-08 [END]  mark a date range as not loaded (sensor reloads it)
-uv run python -m ingest.ops ignore 17 18                          take files out of loading (status ignored)
-uv run python -m ingest.ops reclassify tradeweb/em                forget the table's assignments; the next sync
+uv run ingest-ops reload tradeweb/em 2026-09-08 [END]  mark a date range as not loaded (sensor reloads it)
+uv run ingest-ops ignore 17 18                          take files out of loading (status ignored)
+uv run ingest-ops reclassify tradeweb/em                forget the table's assignments; the next sync
                                                                   re-runs the (changed) patterns
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import date, timedelta
 
 import sqlalchemy as sa
@@ -62,9 +62,8 @@ def reclassify(manifest: Manifest, table: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    from ingest import definitions
-
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--manifest-url", default=os.environ.get("INGEST_MANIFEST_URL", "sqlite:///manifest.db"))
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("reload")
     p.add_argument("table")
@@ -76,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("table")
     args = parser.parse_args(argv)
 
-    manifest: Manifest = definitions.defs.resources["manifest"]
+    manifest = Manifest(url=args.manifest_url)
     if args.command == "reload":
         print(f"{reload(manifest, args.table, args.start, args.end)} file(s) marked for reload")
     elif args.command == "ignore":

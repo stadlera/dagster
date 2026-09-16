@@ -6,11 +6,11 @@ import hashlib
 import posixpath
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 import fsspec
 
 from ingest.config import Feed
+from ingest.remote import modification_time
 from ingest.resources import FileStatus, Landing, Manifest, utcnow
 
 
@@ -32,7 +32,7 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
             if info.get("type") != "file":
                 continue
             remote_path = info["name"]
-            mtime, size = _mtime(info), info.get("size")
+            mtime, size = modification_time(info), info.get("size")
             prev = known.get(remote_path)
 
             if feed.exclude and re.search(feed.exclude, posixpath.basename(remote_path)):
@@ -77,18 +77,6 @@ def sync(fs: fsspec.AbstractFileSystem, feed: Feed, landing: Landing, manifest: 
             (result.revisions if version > 1 else result.downloaded).append(str(local))
 
     return result
-
-
-def _mtime(info: dict) -> str | None:
-    """fsspec backends disagree on the key and type of the modification time. Normalise to ISO text."""
-    value = info.get("mtime") or info.get("LastModified") or info.get("modified")
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        value = datetime.fromtimestamp(value, tz=timezone.utc)
-    if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-    return str(value)
 
 
 def _sha256(path) -> str:

@@ -5,7 +5,6 @@ description = "Dagster based ingestion of external finance datasets"
 requires-python = ">=3.12"
 dependencies = [
     "dagster>=1.13",
-    "dagster-webserver>=1.13",
     "fsspec>=2025.3",
     "sqlalchemy>=2.0",
     "exchange-calendars>=4.10",
@@ -18,11 +17,14 @@ dependencies = [
 sftp = ["paramiko>=3.5"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["dagster-webserver>=1.13", "pytest>=8"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.workspace]
+members = ["tools"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ingest"]
@@ -45,10 +47,11 @@ filterwarnings = [
 
 [tool.ruff]
 line-length = 120
-src = ["src", "tests"]
+src = ["src", "tests", "tools/src", "tools/tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
+"tools/tests/*" = ["E501"]

@@ -1,50 +1,15 @@
-"""Operator helpers and alerting sensors."""
-
-from datetime import date
+"""Runtime alerting sensors."""
 
 import pytest
 from dagster import DagsterEventType, DagsterInstance, asset, build_run_status_sensor_context, materialize
 
-from ingest import ops
 from ingest.alerting import Notifier, build_alerting
 from ingest.config import Dataset
 from ingest.factory import build_definitions
 from ingest.resources import Sql
 
 
-def test_reload_ignore_and_reclassify(ws):
-    ws.sync()
-    table = ws.table()
-    ws.classify(table)
-    rows = ws.manifest.files_for(table.key, date(2026, 9, 8), date(2026, 9, 10))
-    ws.manifest.mark_loaded([r.id for r in rows], "run-1")
-    assert ws.manifest.pending_days(table.key) == {}
-
-    assert ops.reload(ws.manifest, table.key, date(2026, 9, 9)) == 1
-    assert list(ws.manifest.pending_days(table.key)) == [date(2026, 9, 9)]
-
-    assert ops.ignore(ws.manifest, [rows[1].id]) == 1
-    assert ws.manifest.pending_days(table.key) == {} and ws.statuses()["em-2026-09-09.csv"] == "ignored"
-
-    assert ops.reclassify(ws.manifest, table.key) == 1  # the ignored one stays ignored
-    assert ws.manifest.unclassified("tradeweb")[0].remote_path.endswith("em-2026-09-08.csv")
-    assert ws.classify(table) == 1 and list(ws.manifest.pending_days(table.key)) == [date(2026, 9, 8)]
-
-
-def test_ops_cli(ws, monkeypatch, capsys):
-    ws.sync()
-    table = ws.table()
-    ws.classify(table)
-    dataset = Dataset(ws.feed, (table,), schema_dir=ws.tmp)
-    defs = build_definitions([dataset], ws.landing, ws.manifest, Sql(url=ws.sql_url))
-    monkeypatch.setattr("ingest.definitions.defs", defs, raising=False)
-    ops.main(["reclassify", "tradeweb/em"])
-    assert "2 file(s) reset" in capsys.readouterr().out
-
-
 class FakeSmtp:
-    """Stands in for smtplib.SMTP and records what would have been sent."""
-
     sent: list = []
 
     def __init__(self, host, port, timeout):
@@ -85,7 +50,7 @@ def test_failed_checks_are_emailed(ws, mailbox):
     _, on_check_failure = build_alerting()
     ctx = status_context("alert_check_failures", instance, result.dagster_run, DagsterEventType.RUN_SUCCESS)
     list(on_check_failure(ctx) or [])
-    ((to, subject, body),) = mailbox  # the fixture days are long overdue: severity ERROR
+    ((to, subject, body),) = mailbox
     assert to == "ops@example.com" and "1 check(s) failed" in subject
     assert "raw/tradeweb / delivery_em" in body and "violations=" in body
 

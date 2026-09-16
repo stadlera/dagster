@@ -15,6 +15,12 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "ingest",
+    "ingest-tools",
+]
+
 [[package]]
 name = "alembic"
 version = "1.20.0"
@@ -946,7 +952,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "dagster" },
-    { name = "dagster-webserver" },
     { name = "dlt", extra = ["mssql", "sqlalchemy"] },
     { name = "exchange-calendars" },
     { name = "fastavro" },
@@ -962,13 +967,13 @@ sftp = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "dagster-webserver" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "dagster", specifier = ">=1.13" },
-    { name = "dagster-webserver", specifier = ">=1.13" },
     { name = "dlt", extras = ["mssql", "sqlalchemy"], specifier = ">=1.10" },
     { name = "exchange-calendars", specifier = ">=4.10" },
     { name = "fastavro", specifier = ">=1.9" },
@@ -980,7 +985,33 @@ requires-dist = [
 provides-extras = ["sftp"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "dagster-webserver", specifier = ">=1.13" },
+    { name = "pytest", specifier = ">=8" },
+]
+
+[[package]]
+name = "ingest-tools"
+version = "0.1.0"
+source = { editable = "tools" }
+dependencies = [
+    { name = "dlt" },
+    { name = "fsspec" },
+    { name = "ingest" },
+    { name = "numpy" },
+    { name = "pyarrow" },
+    { name = "sqlalchemy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "dlt", specifier = ">=1.10" },
+    { name = "fsspec", specifier = ">=2025.3" },
+    { name = "ingest", editable = "." },
+    { name = "numpy", specifier = ">=2" },
+    { name = "pyarrow", specifier = ">=18" },
+    { name = "sqlalchemy", specifier = ">=2.0" },
+]
 
 [[package]]
 name = "iniconfig"

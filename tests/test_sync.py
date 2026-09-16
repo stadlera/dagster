@@ -74,8 +74,13 @@ def test_subset_names_are_validated_and_remote_options_are_coerced():
     import pytest
 
     from ingest.config import Feed
-    from ingest.resources import Remote, _coerce
+    from ingest.remote import coerce_option
+    from ingest.resources import Remote
 
     with pytest.raises(ValueError, match="subset names"):
         Feed("x", Remote(protocol="file"), "0 7 * * *", {"a/b": "/out"})
-    assert _coerce("22") == 22 and _coerce("true") is True and _coerce("sftp.acme.com") == "sftp.acme.com"
+    assert (
+        coerce_option("22") == 22
+        and coerce_option("true") is True
+        and coerce_option("sftp.acme.com") == "sftp.acme.com"
+    )
